@@ -2,7 +2,7 @@
 
 ## jpbazinet Customizations
 
-This fork includes the following additions on top of the base [synclounge-v3](https://github.com/chrisae9/synclounge-v3):
+This fork includes the following additions on top of the base [synclounge](https://github.com/chrisae9/synclounge):
 
 - **IMDb button** — Appears in the toolbar next to the Invite button when in a room. Grey/disabled when nothing is playing; active when a show or movie is playing, linking directly to the IMDb page for the current title. The IMDb ID is pulled automatically from Plex metadata.
 - **Chat emojis** — The chat panel now supports emojis either through the emoji picker, or typed :).
