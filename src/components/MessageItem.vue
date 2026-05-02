@@ -5,12 +5,10 @@
         <v-img :src="sender.thumb" />
       </v-avatar>
     </template>
-
     <v-list-item-title class="message-username">
       {{ sender.username }}
       <span class="message-time ml-1">{{ formattedTime }}</span>
     </v-list-item-title>
-
     <v-list-item-subtitle>
       <!-- eslint-disable-next-line vue/no-v-html -->
       <div class="message-content" v-html="processedText" />
@@ -33,29 +31,24 @@ function escapeHtml(str) {
 
 export default {
   name: 'MessageItem',
-
   props: {
     message: {
       type: Object,
       required: true,
     },
   },
-
   computed: {
     ...mapGetters('synclounge', [
       'GET_MESSAGES_USER_CACHE_USER',
     ]),
-
     sender() {
       return this.GET_MESSAGES_USER_CACHE_USER(this.message.senderId);
     },
-
     formattedTime() {
       if (!this.message.time) return '';
       const d = new Date(this.message.time);
       return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     },
-
     processedText() {
       const text = this.message.text || '';
       if (text.startsWith('data:image/')) {
@@ -80,18 +73,18 @@ export default {
   padding: 4px 8px !important;
   align-items: flex-start !important;
 }
-
 .message-item + .message-item {
   border-top: 1px solid rgb(255 255 255 / 5%);
 }
-
 .message-avatar {
   box-shadow: 0 0 0 2px rgb(229 160 13 / 50%) !important;
   align-self: flex-start;
-  margin-top: 10px;
-  margin-right: 12px;
+  margin-top: 2px;
 }
-
+:deep(.v-list-item__prepend) {
+  padding-inline-end: 8px !important;
+  align-self: flex-start !important;
+}
 .message-username {
   color: #f0a020 !important;
   font-weight: 700 !important;
@@ -102,13 +95,11 @@ export default {
   overflow: visible !important;
   text-overflow: unset !important;
 }
-
 .message-time {
   color: rgb(255 255 255 / 40%);
   font-weight: 400;
   font-size: 11px;
 }
-
 .message-content {
   font-size: 14px !important;
   font-weight: 400 !important;
@@ -118,36 +109,24 @@ export default {
   word-break: break-word !important;
   overflow-wrap: anywhere !important;
 }
-
 :deep(.v-list-item-subtitle) {
   white-space: normal !important;
   overflow: visible !important;
   text-overflow: unset !important;
   opacity: 1 !important;
+  -webkit-line-clamp: unset !important;
 }
-
 :deep(.chat-link) {
   color: inherit;
   text-decoration: underline;
   word-break: break-all;
 }
-
 :deep(.chat-link:hover) {
   opacity: 0.75;
 }
-
 :deep(.v-list-item__content) {
   overflow: visible !important;
   text-overflow: unset !important;
   white-space: normal !important;
 }
-
-:deep(.v-list-item-subtitle) {
-  overflow: visible !important;
-  white-space: normal !important;
-  text-overflow: unset !important;
-  opacity: 1 !important;
-  -webkit-line-clamp: unset !important;
-}
-
 </style>
