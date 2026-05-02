@@ -276,6 +276,7 @@ export default {
   display: flex;
   align-items: center;
   width: 100%;
+  margin-bottom: 4px;
 }
 .emoji-btn {
   flex-shrink: 0;
