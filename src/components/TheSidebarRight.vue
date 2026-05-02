@@ -329,7 +329,7 @@ export default {
 .sidebar-switch :deep(.v-label) {
   font-size: 0.8rem;
   opacity: 0.85;
-  padding-inline-start: 8px;
+  padding-inline-start: 14px;
 }
 
 .sidebar-blur {
