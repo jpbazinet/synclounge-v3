@@ -325,5 +325,6 @@ export default {
 }
 :deep(.v-navigation-drawer__append) {
   overflow: visible;
+  margin-top: 2px;
 }
 </style>
