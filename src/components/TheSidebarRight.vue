@@ -53,7 +53,7 @@
 
       <v-list-item
         density="compact"
-        class="px-3 py-0 switch-item"
+        class="px-3 py-2 switch-item"
       >
         <v-switch
           v-if="AM_I_HOST"
@@ -81,7 +81,7 @@
         <template #activator="{ props }">
           <v-list-item
             density="compact"
-            class="px-3 py-0 switch-item"
+            class="px-3 py-2 switch-item"
             v-bind="props"
           >
             <v-switch
@@ -102,7 +102,7 @@
       <v-list-item
         v-if="AM_I_HOST"
         density="compact"
-        class="px-3 py-0"
+        class="px-3 py-2"
       >
         <v-tooltip
           location="bottom"
@@ -133,7 +133,7 @@
         v-if="!AM_I_HOST
           && GET_HOST_USER && GET_HOST_USER.state !== 'stopped'"
         density="compact"
-        class="px-3 py-0"
+        class="px-3 py-2"
       >
         <div class="d-flex ga-2">
           <v-tooltip
@@ -229,7 +229,7 @@ export default {
 
     ...mapGetters('synclounge', [
       'IS_PARTY_PAUSING_ENABLED',
-      'IS_AUTO_HOST_ENABLED',
+      'IS_AUTO_HOST_ENABLD',
       'GET_USERS',
       'GET_HOST_USER',
       'AM_I_HOST',
@@ -251,7 +251,7 @@ export default {
     ]),
 
     ...mapMutations([
-      'SET_RIGHT_SIDEBAR_OPEN',
+      'SET_RIGHT_SIDEBAREOPEN',
     ]),
 
     async handleManualSync() {
@@ -321,5 +321,8 @@ export default {
 
 .sidebar-blur :deep(.v-navigation-drawer__content) {
   overscroll-behavior: contain;
+}
+:deep(.v-navigation-drawer__append) {
+  overflow: visible;
 }
 </style>
