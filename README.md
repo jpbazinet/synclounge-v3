@@ -1,5 +1,16 @@
 ![SyncLounge](https://github.com/synclounge/synclounge/raw/master/src/assets/images/logos/logo-long-dark.png)
 
+## jpbazinet Customizations
+
+This fork includes the following additions on top of the base [synclounge-v3](https://github.com/chrisae9/synclounge-v3):
+
+- **IMDb button** — Appears in the toolbar next to the Invite button when in a room. Grey/disabled when nothing is playing; active when a show or movie is playing, linking directly to the IMDb page for the current title. The IMDb ID is pulled automatically from Plex metadata.
+- **Chat autoscroll** — The chat panel now correctly scrolls to the latest message when new messages arrive, including messages from other users mid-scroll.
+- **Chat send button** — Fixed the send button icon rendering (was invisible due to icon font mismatch).
+- **Mobile chat drawer** — Fixed a regression where tapping outside the chat panel on mobile no longer closed it.
+
+---
+
 # SyncLounge
 
 SyncLounge is a tool to sync [Plex](https://plex.tv) content across multiple players in multiple locations. Watch movies and TV shows together with friends and family, no matter where they are.
