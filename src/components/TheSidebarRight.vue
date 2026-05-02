@@ -102,7 +102,7 @@
       <v-list-item
         v-if="AM_I_HOST"
         density="compact"
-        class="px-3 py-2"
+        class="px-3 py-0"
       >
         <v-tooltip
           location="bottom"
@@ -133,7 +133,7 @@
         v-if="!AM_I_HOST
           && GET_HOST_USER && GET_HOST_USER.state !== 'stopped'"
         density="compact"
-        class="px-3 py-2"
+        class="px-3 py-0"
       >
         <div class="d-flex ga-2">
           <v-tooltip
@@ -229,7 +229,7 @@ export default {
 
     ...mapGetters('synclounge', [
       'IS_PARTY_PAUSING_ENABLED',
-      'IS_AUTO_HOST_ENABLD',
+      'IS_AUTO_HOST_ENABLED',
       'GET_USERS',
       'GET_HOST_USER',
       'AM_I_HOST',
@@ -251,7 +251,7 @@ export default {
     ]),
 
     ...mapMutations([
-      'SET_RIGHT_SIDEBAREOPEN',
+      'SET_RIGHT_SIDEBAR_OPEN',
     ]),
 
     async handleManualSync() {
@@ -263,7 +263,7 @@ export default {
     },
 
     async handleForceSync() {
-      this.forceSyncDisabled= true;
+      this.forceSyncDisabled = true;
       await this.FORCE_SYNC_ALL();
       this.DISPLAY_NOTIFICATION({
         text: 'Force sync sent to all users',
@@ -310,9 +310,8 @@ export default {
 .sidebar-switch :deep(.v-label) {
   font-size: 0.8rem;
   opacity: 0.85;
-  padding-inline-start: 16px;
+  padding-inline-start: 8px;
 }
-
 
 .sidebar-blur {
   backdrop-filter: blur(16px);
@@ -324,7 +323,6 @@ export default {
   overscroll-behavior: contain;
 }
 :deep(.v-navigation-drawer__append) {
-  overflow: hidden;
   margin-top: 2px;
 }
 </style>
