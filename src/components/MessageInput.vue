@@ -276,6 +276,8 @@ export default {
   display: flex;
   align-items: center;
   width: 100%;
+  min-width: 0;
+  overflow: hidden;
   margin-bottom: 4px;
 }
 .emoji-btn {
