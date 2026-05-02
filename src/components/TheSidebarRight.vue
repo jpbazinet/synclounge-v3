@@ -324,7 +324,7 @@ export default {
   overscroll-behavior: contain;
 }
 :deep(.v-navigation-drawer__append) {
-  overflow: visible;
+  overflow: hidden;
   margin-top: 2px;
 }
 </style>
