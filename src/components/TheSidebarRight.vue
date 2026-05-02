@@ -53,7 +53,7 @@
 
       <v-list-item
         density="compact"
-        class="px-3 py-2 switch-item"
+        class="px-3 py-0 switch-item"
       >
         <v-switch
           v-if="AM_I_HOST"
@@ -81,7 +81,7 @@
         <template #activator="{ props }">
           <v-list-item
             density="compact"
-            class="px-3 py-2 switch-item"
+            class="px-3 py-0 switch-item"
             v-bind="props"
           >
             <v-switch
@@ -263,7 +263,7 @@ export default {
     },
 
     async handleForceSync() {
-      this.forceSyncDisabled = true;
+      this.forceSyncDisabled= true;
       await this.FORCE_SYNC_ALL();
       this.DISPLAY_NOTIFICATION({
         text: 'Force sync sent to all users',
@@ -310,8 +310,9 @@ export default {
 .sidebar-switch :deep(.v-label) {
   font-size: 0.8rem;
   opacity: 0.85;
-  padding-inline-start: 8px;
+  padding-inline-start: 16px;
 }
+
 
 .sidebar-blur {
   backdrop-filter: blur(16px);
