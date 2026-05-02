@@ -38,15 +38,24 @@ export default {
   },
 
   watch: {
-    GET_MESSAGES() {
-      if (!this.userScrolledUp) {
-        this.$nextTick(this.scrollToBottom);
-      }
+    GET_MESSAGES: {
+      handler() {
+        if (!this.userScrolledUp) {
+          this.$nextTick(this.scrollToBottom);
+        }
+      },
+      deep: true,
     },
   },
 
   mounted() {
     this.$nextTick(this.scrollToBottom);
+  },
+
+  updated() {
+    if (!this.userScrolledUp) {
+      this.scrollToBottom();
+    }
   },
 
   methods: {
