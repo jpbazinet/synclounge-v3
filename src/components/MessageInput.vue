@@ -69,7 +69,7 @@
       title="Send"
       @click="sendMessage"
     >
-      <v-icon size="20">mdi-send</v-icon>
+      <v-icon size="20">send</v-icon>
     </v-btn>
   </div>
 </template>
