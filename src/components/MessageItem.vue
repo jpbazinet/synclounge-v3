@@ -81,7 +81,7 @@ export default {
   margin-top: 2px;
 }
 :deep(.v-list-item__prepend) {
-  padding-inline-end: 10px !important;
+  padding-inline-end: 0px !important;
   align-self: flex-start !important;
 }
 .message-username {
