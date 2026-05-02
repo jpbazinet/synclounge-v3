@@ -196,7 +196,7 @@ export default {
       return entry ? entry.id.slice(7) : null;
     },
 
-    showAppBarExtension() {{
+    showAppBarExtension() {
       return this.$route.meta.showAppBarExtension;
     },
 
