@@ -47,6 +47,23 @@
           </v-icon>
           <span class="d-none d-sm-inline">Invite</span>
         </v-btn>
+        <v-btn
+          v-if="inviteUrl"
+          variant="flat"
+          color="primary"
+          class="text-white"
+          :disabled="!imdbId"
+          :href="imdbId ? `https://www.imdb.com/title/${imdbId}/` : undefined"
+          target="_blank"
+        >
+          <v-icon
+            start
+            class="d-sm-none"
+          >
+            movie
+          </v-icon>
+          <span class="d-none d-sm-inline">IMDb</span>
+        </v-btn>
       </v-toolbar-items>
 
       <router-view name="rightSidebarButton" />
@@ -156,6 +173,7 @@ export default {
       'GET_NAVIGATE_TO_PLAYER',
       'GET_NAVIGATE_HOME',
       'GET_NAVIGATE_SIGN_IN',
+      'GET_ACTIVE_METADATA',
     ]),
 
     ...mapGetters('plex', [
@@ -171,7 +189,14 @@ export default {
       'GET_ACTIVE_MEDIA_METADATA',
     ]),
 
-    showAppBarExtension() {
+    imdbId() {
+      const meta = this.GET_ACTIVE_METADATA;
+      if (!meta?.Guid) return null;
+      const entry = meta.Guid.find((g) => g.id?.startsWith('imdb://'));
+      return entry ? entry.id.slice(7) : null;
+    },
+
+    showAppBarExtension() {{
       return this.$route.meta.showAppBarExtension;
     },
 
