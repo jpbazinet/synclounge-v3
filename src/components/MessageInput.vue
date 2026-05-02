@@ -8,14 +8,14 @@
       nudge-top="8"
       max-width="320"
     >
-      <template #activator="{ on, attrs }">
+      <template #activator="{ props }">
         <v-btn
           icon
-          small
+          variant="text"
+          density="compact"
           class="emoji-btn ml-1"
-          v-bind="attrs"
+          v-bind="props"
           title="Emoji"
-          v-on="on"
         >
           <span class="emoji-trigger">&#x1F642;</span>
         </v-btn>
@@ -49,19 +49,27 @@
     <v-text-field
       ref="messageInput"
       v-model="messageToBeSent"
-      append-inner-icon="mdi-send"
       label="Message"
       hide-details
       single-line
       density="compact"
       variant="outlined"
       rounded
-      class="ml-1 mr-2 flex-input"
-      @click:append-inner="sendMessage"
+      class="ml-1 flex-input"
       @keyup.enter="sendMessage"
       @keyup.space="convertEmoticons"
       @paste="handlePaste"
     />
+    <v-btn
+      icon
+      variant="text"
+      density="compact"
+      class="send-btn mx-1"
+      title="Send"
+      @click="sendMessage"
+    >
+      <v-icon size="20">mdi-send</v-icon>
+    </v-btn>
   </div>
 </template>
 
@@ -271,7 +279,10 @@ export default {
 .emoji-btn {
   flex-shrink: 0;
   align-self: center;
-  margin-top: 6px;
+}
+.send-btn {
+  flex-shrink: 0;
+  align-self: center;
 }
 .emoji-trigger {
   font-size: 18px;
