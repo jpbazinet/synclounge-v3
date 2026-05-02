@@ -7,7 +7,6 @@
     </template>
     <v-list-item-title class="message-username">
       {{ sender.username }}
-      <span class="message-time ml-1">{{ formattedTime }}</span>
     </v-list-item-title>
     <v-list-item-subtitle>
       <!-- eslint-disable-next-line vue/no-v-html -->
@@ -70,7 +69,7 @@ export default {
 
 <style scoped>
 .message-item {
-  padding: 4px 8px !important;
+  padding: 4px 12px !important;
   align-items: flex-start !important;
 }
 .message-item + .message-item {
@@ -82,7 +81,7 @@ export default {
   margin-top: 2px;
 }
 :deep(.v-list-item__prepend) {
-  padding-inline-end: 8px !important;
+  padding-inline-end: 10px !important;
   align-self: flex-start !important;
 }
 .message-username {
