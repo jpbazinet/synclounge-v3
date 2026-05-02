@@ -41,6 +41,16 @@
 
         <template #append>
           <v-btn
+            size="small"
+            variant="text"
+            :disabled="!imdbId"
+            :href="imdbId ? `https://www.imdb.com/title/${imdbId}/` : undefined"
+            target="_blank"
+            class="imdb-btn"
+          >
+            IMDb
+          </v-btn>
+          <v-btn
             icon
             size="small"
             variant="text"
@@ -234,6 +244,15 @@ export default {
       'GET_HOST_USER',
       'AM_I_HOST',
     ]),
+
+    ...mapGetters(['GET_ACTIVE_METADATA']),
+
+    imdbId() {
+      const meta = this.GET_ACTIVE_METADATA;
+      if (!meta?.Guid) return null;
+      const entry = meta.Guid.find((g) => g.id?.startsWith('imdb://'));
+      return entry ? entry.id.slice(7) : null;
+    },
   },
 
   methods: {
@@ -324,5 +343,16 @@ export default {
 }
 :deep(.v-navigation-drawer__append) {
   margin-top: 2px;
+}
+.imdb-btn {
+  color: #F5C518 !important;
+  font-weight: bold;
+  font-size: 11px;
+  min-width: 0 !important;
+  padding: 0 4px !important;
+}
+.imdb-btn.v-btn--disabled {
+  opacity: 0.4 !important;
+  color: rgba(255, 255, 255, 0.5) !important;
 }
 </style>
