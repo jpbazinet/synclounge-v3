@@ -33,7 +33,7 @@
     "eslint-import-resolver-alias": "^1.1.2",
     "eslint-plugin-import": "^2.32.0",
     "eslint-plugin-vue": "^9.32.0",
-    "fast-xml-parser": "^4.5.3",
+    "fast-xml-parser": "^5.7.2",
     "happy-dom": "^20.7.0",
     "mux.js": "^6.3.0",
     "sass": "^1.93.2",
