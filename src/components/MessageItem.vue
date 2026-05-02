@@ -135,4 +135,19 @@ export default {
 :deep(.chat-link:hover) {
   opacity: 0.75;
 }
+
+:deep(.v-list-item__content) {
+  overflow: visible !important;
+  text-overflow: unset !important;
+  white-space: normal !important;
+}
+
+:deep(.v-list-item-subtitle) {
+  overflow: visible !important;
+  white-space: normal !important;
+  text-overflow: unset !important;
+  opacity: 1 !important;
+  -webkit-line-clamp: unset !important;
+}
+
 </style>
