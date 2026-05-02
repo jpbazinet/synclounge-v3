@@ -6,7 +6,7 @@
       top
       offset-y
       nudge-top="8"
-      max-width="320"
+      max-width="360"
     >
       <template #activator="{ props }">
         <v-btn
@@ -55,6 +55,7 @@
       density="compact"
       variant="outlined"
       rounded
+      color="#e5a00d"
       class="ml-1 flex-input"
       @keyup.enter="sendMessage"
       @keyup.space="convertEmoticons"
@@ -289,14 +290,15 @@ export default {
   line-height: 1;
 }
 .emoji-picker {
-  width: 300px;
+  width: 340px;
 }
 .emoji-grid {
   display: grid;
   grid-template-columns: repeat(8, 1fr);
   gap: 2px;
-  max-height: 200px;
+  max-height: 220px;
   overflow-y: auto;
+  overflow-x: hidden;
 }
 .flex-input {
   flex: 1;
