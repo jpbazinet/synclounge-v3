@@ -11,7 +11,7 @@
       style="z-index: 5;"
       :extension-height="showAppBarExtension ? 80 : 0"
     >
-      <v-app-bar-nav-icon @click="SET_LEFT_SIDEBAR_OPEN" />
+      <v-app-bar-nav-icon @click="SET_LEFT_SIDEBAR_OPEN" />h
 
       <router-link
         :to="{ name: 'RoomCreation' }"
@@ -190,7 +190,7 @@ export default {
     ]),
 
     imdbId() {
-      const meta = this.GET_ACTIVE_METADATA;
+      const meta = this.GET_ACTIVE_METADATA || this.GET_ACTIVE_MEDIA_METADATA;
       if (!meta?.Guid) return null;
       const entry = meta.Guid.find((g) => g.id?.startsWith('imdb://'));
       return entry ? entry.id.slice(7) : null;
