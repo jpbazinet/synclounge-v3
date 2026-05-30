@@ -34,7 +34,7 @@
             variant="flat"
             color="primary"
             class="unmute-banner text-white"
-            @click.stop="UNMUTE_AFTER_AUTOPLAY_BLOCK"
+            @click.stop="handleAutoplayUnblock"
           >
             <v-icon start>mdi-volume-off</v-icon>
             Click to unmute
@@ -388,6 +388,12 @@ export default {
       };
     },
 
+    async handleAutoplayUnblock() {
+      await this.UNMUTE_AFTER_AUTOPLAY_BLOCK();
+      if (!this.AM_I_HOST) {
+        await this.MANUAL_SYNC();
+      }
+    },
     isTyping() {
       const { activeElement } = document;
       if (!activeElement) return false;
