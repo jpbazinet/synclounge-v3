@@ -1,5 +1,16 @@
 ![SyncLounge](https://github.com/synclounge/synclounge/raw/master/src/assets/images/logos/logo-long-dark.png)
 
+## jpbazinet Customizations
+
+This fork includes the following additions on top of the base [synclounge](https://github.com/chrisae9/synclounge):
+
+- **IMDb button** — Appears in the toolbar next to the Invite button when in a room. Grey/disabled when nothing is playing; active when a show or movie is playing, linking directly to the IMDb page for the current title. The IMDb ID is pulled automatically from Plex metadata.
+- **Chat emojis** — The chat panel now supports emojis either through the emoji picker, or typed :).
+- **Chat images** — You can also cut and paste images directly into chat.
+- **Chat URLs** — Links shared in chat are clickable.
+
+---
+
 # SyncLounge
 
 SyncLounge is a tool to sync [Plex](https://plex.tv) content across multiple players in multiple locations. Watch movies and TV shows together with friends and family, no matter where they are.
