@@ -23,7 +23,7 @@
   },
   "devDependencies": {
     "@delucis/if-env": "^1.1.2",
-    "@vitejs/plugin-vue": "^5.2.0",
+    "@vitejs/plugin-vue": "^6.0.6",
     "@vue/test-utils": "^2.4.6",
     "caf": "^15.0.1",
     "date-fns": "^2.30.0",
