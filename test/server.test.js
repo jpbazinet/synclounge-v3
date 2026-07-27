@@ -1,13 +1,24 @@
 const { describe, it, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
+const os = require('node:os');
 
-const BASE = 'http://localhost:18088';
+let baseUrl;
 let serverProcess;
+let posterFixtureServer;
+let posterFixtureBase;
+
+async function getFreePort() {
+  const server = http.createServer();
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  await new Promise((resolve) => server.close(resolve));
+  return port;
+}
 
 // Helper to make HTTP requests
 async function request(path, { method = 'GET', body, headers = {} } = {}) {
-  const res = await fetch(`${BASE}${path}`, {
+  const res = await fetch(`${baseUrl}${path}`, {
     method,
     headers,
     ...(body && { body: JSON.stringify(body) }),
@@ -29,19 +40,46 @@ async function waitForServer(url, retries = 30, delay = 200) {
 
 describe('server', () => {
   before(async () => {
+    posterFixtureServer = http.createServer((req, res) => {
+      if (req.url === '/image/jpeg') {
+        res.writeHead(200, { 'Content-Type': 'image/jpeg' });
+        res.end(Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
+        return;
+      }
+      if (req.url === '/status/404') {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('not found');
+        return;
+      }
+      res.writeHead(500, { 'Content-Type': 'text/plain' });
+      res.end('unexpected fixture path');
+    });
+    await new Promise((resolve) => posterFixtureServer.listen(0, '0.0.0.0', resolve));
+    posterFixtureBase = `http://${os.hostname()}:${posterFixtureServer.address().port}`;
+
     const { spawn } = require('node:child_process');
+    const port = await getFreePort();
+    baseUrl = `http://127.0.0.1:${port}`;
     serverProcess = spawn('node', ['server.js'], {
       cwd: __dirname + '/..',
-      env: { ...process.env, PORT: '18088', SL_METADATA_RATE_LIMIT: '0', SL_POSTER_RATE_LIMIT: '0' },
+      env: {
+        ...process.env,
+        PORT: String(port),
+        SL_METADATA_RATE_LIMIT: '0',
+        SL_POSTER_RATE_LIMIT: '0',
+      },
       stdio: 'pipe',
     });
     serverProcess.stderr.on('data', (d) => process.stderr.write(d));
-    await waitForServer(`${BASE}/health`);
+    await waitForServer(`${baseUrl}/health`);
   });
 
   after(() => {
     if (serverProcess) {
       serverProcess.kill('SIGTERM');
+    }
+    if (posterFixtureServer) {
+      posterFixtureServer.close();
     }
   });
 
@@ -70,13 +108,13 @@ describe('server', () => {
     });
 
     it('does not intercept static assets (.js)', async () => {
-      const res = await request('/js/nonexistent.js');
+      const res = await request('/assets/nonexistent.js');
       // Should fall through to express.static which returns 404, not index.html
       assert.equal(res.status, 404);
     });
 
     it('does not intercept static assets (.css)', async () => {
-      const res = await request('/css/nonexistent.css');
+      const res = await request('/assets/nonexistent.css');
       assert.equal(res.status, 404);
     });
 
@@ -98,22 +136,21 @@ describe('server', () => {
   // --- Static assets ---
 
   describe('static assets', () => {
-    it('serves JS files with absolute paths', async () => {
-      // Find an actual JS file in dist
+    it('serves Vite JS files with absolute paths', async () => {
       const indexRes = await request('/');
       const html = await indexRes.text();
-      const jsMatch = html.match(/src="(\/js\/[^"]+)"/);
-      if (!jsMatch) return; // skip if no JS found
+      const jsMatch = html.match(/src="(\/assets\/[^"]+\.js)"/);
+      assert.ok(jsMatch, 'dist/index.html should reference a Vite /assets/*.js file; run npm run build first');
       const res = await request(jsMatch[1]);
       assert.equal(res.status, 200);
       assert.ok(res.headers.get('content-type').includes('javascript'));
     });
 
-    it('serves CSS files with absolute paths', async () => {
+    it('serves Vite CSS files with absolute paths', async () => {
       const indexRes = await request('/');
       const html = await indexRes.text();
-      const cssMatch = html.match(/href="(\/css\/[^"]+)"/);
-      if (!cssMatch) return;
+      const cssMatch = html.match(/href="(\/assets\/[^"]+\.css)"/);
+      assert.ok(cssMatch, 'dist/index.html should reference a Vite /assets/*.css file; run npm run build first');
       const res = await request(cssMatch[1]);
       assert.equal(res.status, 200);
       assert.ok(res.headers.get('content-type').includes('css'));
@@ -380,7 +417,7 @@ describe('server', () => {
         body: {
           title: 'Proxy Test',
           type: 'movie',
-          posterUrl: 'https://httpbin.org/image/jpeg',
+          posterUrl: `${posterFixtureBase}/image/jpeg`,
           machineIdentifier: 'proxy-machine',
           ratingKey: '400',
         },
@@ -416,7 +453,7 @@ describe('server', () => {
 
   describe('POST /api/metadata input edge cases', () => {
     it('does not crash when Content-Type header is missing', async () => {
-      const res = await fetch(`${BASE}/api/metadata`, {
+      const res = await fetch(`${baseUrl}/api/metadata`, {
         method: 'POST',
         body: JSON.stringify({ machineIdentifier: 'x', ratingKey: '1' }),
         // No Content-Type header
@@ -426,7 +463,7 @@ describe('server', () => {
     });
 
     it('does not crash when Content-Type is text/plain', async () => {
-      const res = await fetch(`${BASE}/api/metadata`, {
+      const res = await fetch(`${baseUrl}/api/metadata`, {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain' },
         body: JSON.stringify({ machineIdentifier: 'x', ratingKey: '1' }),
@@ -925,7 +962,7 @@ describe('server', () => {
         body: {
           title: '404 Upstream',
           type: 'movie',
-          posterUrl: 'https://httpbin.org/status/404',
+          posterUrl: `${posterFixtureBase}/status/404`,
           machineIdentifier: 'upstream4xx',
           ratingKey: '702',
         },
@@ -974,7 +1011,7 @@ describe('server', () => {
         body: {
           title: 'Legit',
           type: 'movie',
-          posterUrl: 'https://httpbin.org/image/jpeg',
+          posterUrl: `${posterFixtureBase}/image/jpeg`,
           machineIdentifier: 'ssrf-legit',
           ratingKey: '1',
         },

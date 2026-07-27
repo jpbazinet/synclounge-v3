@@ -39,6 +39,7 @@ function createSyncContext(getterOverrides = {}) {
   const getters = {
     AM_I_HOST: false,
     IS_HOST_GRACE_PERIOD: false,
+    GET_HOST_RESTORE_PENDING_ID: null,
     IS_IN_ROOM: true,
     IS_JOIN_SYNC_IN_PROGRESS: false,
     GET_SOCKET_ID: 'me-1',
@@ -203,11 +204,11 @@ describe('Sync Token Deadlock (Bug 1)', () => {
 
 describe('MANUAL_SYNC token cleanup (Bug 5)', () => {
   it('MANUAL_SYNC does not orphan token when overwritten by concurrent sync', async () => {
-    // 1. MANUAL_SYNC creates tokenM, starts SEEK_TO
+    // 1. MANUAL_SYNC creates tokenM, starts plexclients/SYNC
     // 2. SYNC_PLAYER_STATE runs, overwrites tokenM with tokenS
     // 3. MANUAL_SYNC finishes — its === check fails, token must not be orphaned
 
-    let resolveSeek;
+    let resolveSync;
     const ctx = createSyncContext();
 
     ctx.dispatch.mockImplementation((action) => {
@@ -220,8 +221,8 @@ describe('MANUAL_SYNC token cleanup (Bug 5)', () => {
         }
         return Promise.resolve();
       }
-      if (action === 'plexclients/SEEK_TO') {
-        return new Promise((resolve) => { resolveSeek = resolve; });
+      if (action === 'plexclients/SYNC') {
+        return new Promise((resolve) => { resolveSync = resolve; });
       }
       if (action === 'PROCESS_PLAYER_STATE_UPDATE') {
         return Promise.resolve();
@@ -240,14 +241,34 @@ describe('MANUAL_SYNC token cleanup (Bug 5)', () => {
     const tokenS = new CAF.cancelToken();
     ctx.commit('SET_SYNC_CANCEL_TOKEN', tokenS);
 
-    // Resolve the seek — MANUAL_SYNC's cleanup runs
-    resolveSeek();
+    // Resolve sync — MANUAL_SYNC's cleanup runs
+    resolveSync();
     await manualPromise;
 
     // tokenS must not be cleared by MANUAL_SYNC's cleanup
     // (Currently MANUAL_SYNC only clears if === tokenM, which is correct.
     // But it should also not leave tokenM orphaned if it fails the check.)
     expect(ctx.getSyncCancelToken()).toBe(tokenS);
+  });
+
+  it('MANUAL_SYNC uses the shared plexclient sync strategy instead of direct seek', async () => {
+    const ctx = createSyncContext();
+
+    ctx.dispatch.mockImplementation((action) => {
+      if (action === 'CANCEL_IN_PROGRESS_SYNC' || action === 'PROCESS_PLAYER_STATE_UPDATE') {
+        return Promise.resolve();
+      }
+      if (action === 'plexclients/SYNC') {
+        return Promise.resolve('synced');
+      }
+      return Promise.resolve();
+    });
+
+    await actions.MANUAL_SYNC(ctx);
+
+    expect(ctx.dispatch).toHaveBeenCalledWith('plexclients/SYNC', expect.anything(), { root: true });
+    expect(ctx.dispatch).not.toHaveBeenCalledWith('plexclients/SEEK_TO', expect.anything(), { root: true });
+    expect(ctx.getSyncCancelToken()).toBeNull();
   });
 });
 
@@ -434,6 +455,101 @@ describe('Post-buffering sync cooldown', () => {
   });
 });
 
+describe('Autoplay-muted client sync', () => {
+  it('resumes a paused client when the host is playing even if unmute is still required', async () => {
+    const ctx = createSyncContext();
+    ctx.rootGetters['slplayer/IS_AUTOPLAY_BLOCKED'] = true;
+    ctx.dispatch.mockImplementation((action) => {
+      if (action === 'plexclients/FETCH_TIMELINE_POLL_DATA_CACHE') {
+        return Promise.resolve({
+          state: 'paused', time: 10000, duration: 100000,
+        });
+      }
+      return Promise.resolve();
+    });
+    const cancelSignal = new AbortController().signal;
+
+    await actions._SYNC_PLAYER_STATE(ctx, cancelSignal);
+
+    expect(ctx.dispatch).toHaveBeenCalledWith(
+      'plexclients/PRESS_PLAY',
+      cancelSignal,
+      { root: true },
+    );
+  });
+
+  it('waits for the matching command acknowledgment before resuming synchronization', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10000);
+    const ctx = createSyncContext();
+    const hostUser = ctx.getters.GET_HOST_USER;
+    ctx.dispatch.mockImplementation((action) => {
+      if (action === 'plexclients/FETCH_TIMELINE_POLL_DATA_CACHE') {
+        return Promise.resolve({
+          state: 'paused', time: 10000, duration: 100000,
+        });
+      }
+      return Promise.resolve();
+    });
+
+    actions.MARK_PARTY_PAUSE_RECEIVED(null, {
+      isPause: true,
+      requestId: 'request-1',
+    });
+    await vi.advanceTimersByTimeAsync(6000);
+    await actions._SYNC_PLAYER_STATE(ctx, new AbortController().signal);
+
+    expect(ctx.dispatch).not.toHaveBeenCalledWith(
+      'plexclients/PRESS_PLAY',
+      expect.anything(),
+      { root: true },
+    );
+
+    expect(actions.ACKNOWLEDGE_PARTY_PAUSE(null, 'stale-request')).toBe(false);
+    hostUser.state = 'paused';
+    await actions._SYNC_PLAYER_STATE(ctx, new AbortController().signal);
+    hostUser.state = 'playing';
+    await actions._SYNC_PLAYER_STATE(ctx, new AbortController().signal);
+    expect(ctx.dispatch).not.toHaveBeenCalledWith(
+      'plexclients/PRESS_PLAY',
+      expect.anything(),
+      { root: true },
+    );
+    expect(actions.ACKNOWLEDGE_PARTY_PAUSE(null, 'request-1')).toBe(true);
+
+    hostUser.state = 'paused';
+    await actions._SYNC_PLAYER_STATE(ctx, new AbortController().signal);
+    hostUser.state = 'playing';
+    await actions._SYNC_PLAYER_STATE(ctx, new AbortController().signal);
+
+    expect(ctx.dispatch).toHaveBeenCalledWith(
+      'plexclients/PRESS_PLAY',
+      expect.anything(),
+      { root: true },
+    );
+    vi.useRealTimers();
+  });
+
+  it('releases command protection if a current server acknowledgment never arrives', async () => {
+    vi.useFakeTimers();
+
+    actions.MARK_PARTY_PAUSE_RECEIVED(null, {
+      isPause: true,
+      requestId: 'request-1',
+    });
+    await vi.advanceTimersByTimeAsync(29999);
+    expect(actions.ACKNOWLEDGE_PARTY_PAUSE(null, 'request-1')).toBe(true);
+
+    actions.MARK_PARTY_PAUSE_RECEIVED(null, {
+      isPause: true,
+      requestId: 'request-2',
+    });
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(actions.ACKNOWLEDGE_PARTY_PAUSE(null, 'request-2')).toBe(false);
+    vi.useRealTimers();
+  });
+});
+
 describe('Sync poll interval guards', () => {
   it('START_SYNC_POLL_INTERVAL guards against running sync when token exists', async () => {
     vi.useFakeTimers();
@@ -458,6 +574,22 @@ describe('Sync poll interval guards', () => {
     // Should NOT have dispatched SYNC_PLAYER_STATE because token is non-null
     expect(ctx.dispatch).not.toHaveBeenCalledWith('SYNC_PLAYER_STATE');
 
+    vi.useRealTimers();
+  });
+
+  it('blocks all general sync entry points while host restoration is pending', async () => {
+    vi.useFakeTimers();
+    const ctx = createSyncContext({ GET_HOST_RESTORE_PENDING_ID: 'host-1' });
+
+    await actions.SYNC_MEDIA_AND_PLAYER_STATE(ctx);
+    await actions.SYNC_PLAYER_STATE(ctx);
+    actions.START_SYNC_POLL_INTERVAL(ctx);
+    await vi.advanceTimersByTimeAsync(5500);
+
+    expect(ctx.dispatch).not.toHaveBeenCalledWith('_SYNC_MEDIA_AND_PLAYER_STATE', expect.anything());
+    expect(ctx.dispatch).not.toHaveBeenCalledWith('_SYNC_PLAYER_STATE', expect.anything());
+    expect(ctx.dispatch).not.toHaveBeenCalledWith('SYNC_PLAYER_STATE');
+    expect(ctx.getSyncCancelToken()).toBeNull();
     vi.useRealTimers();
   });
 });

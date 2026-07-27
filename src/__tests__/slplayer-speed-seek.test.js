@@ -37,6 +37,7 @@ vi.mock('@/player', () => ({
   getBigPlayButton: vi.fn(() => ({ addEventListener: vi.fn(), removeEventListener: vi.fn() })),
   unload: vi.fn(),
   isCasting: vi.fn(() => false),
+  getMediaElement: vi.fn(() => ({ muted: true })),
   addCastStatusListener: vi.fn(),
   removeCastStatusListener: vi.fn(),
 }));
@@ -59,7 +60,166 @@ vi.mock('@/utils/deferredpromise', () => ({
   }),
 }));
 
-const { setPlaybackRate } = await import('@/player');
+const {
+  setPlaybackRate, setCurrentTimeMs, waitForMediaElementEvent, getCurrentTimeMs,
+  isPaused, isBuffering,
+} = await import('@/player');
+
+describe('REFRESH_PLAYER_STATE', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('reports the media element paused state before an acknowledgment is sent', async () => {
+    isPaused.mockReturnValue(true);
+    isBuffering.mockReturnValue(false);
+    const commit = vi.fn();
+    const dispatch = vi.fn().mockResolvedValue(undefined);
+
+    await slplayerActions.REFRESH_PLAYER_STATE({ commit, dispatch });
+
+    expect(commit).toHaveBeenCalledWith('SET_PLAYER_STATE', 'paused');
+    expect(dispatch).toHaveBeenCalledWith('synclounge/PROCESS_PLAYER_STATE_UPDATE', true, {
+      root: true,
+    });
+    expect(dispatch).not.toHaveBeenCalledWith('SEND_PLEX_TIMELINE_UPDATE');
+  });
+});
+
+describe('INIT_PLAYER_STATE', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('does not request a Plex media source when the player route opens without active media', async () => {
+    const commit = vi.fn();
+    const dispatch = vi.fn(() => Promise.resolve());
+    const getters = {
+      GET_PLAYER_INITIALIZED_DEFERRED_PROMISE: null,
+    };
+    const rootGetters = {
+      'settings/GET_SLPLAYERVOLUME': 1,
+      'plexclients/GET_ACTIVE_MEDIA_METADATA': null,
+      'plexclients/GET_ACTIVE_SERVER_ID': null,
+    };
+
+    await slplayerActions.INIT_PLAYER_STATE({
+      getters,
+      rootGetters,
+      commit,
+      dispatch,
+    });
+
+    expect(dispatch).toHaveBeenCalledWith('REGISTER_PLAYER_EVENTS');
+    expect(dispatch).toHaveBeenCalledWith('START_UPDATE_PLAYER_CONTROLS_SHOWN_INTERVAL');
+    expect(dispatch).not.toHaveBeenCalledWith('CHANGE_PLAYER_SRC');
+    expect(dispatch).not.toHaveBeenCalledWith('START_PERIODIC_PLEX_TIMELINE_UPDATE');
+    expect(commit).toHaveBeenCalledWith('SET_IS_PLAYER_INITIALIZED', true);
+  });
+
+  it('loads media without pressing play when initialized while following a paused host', async () => {
+    const commit = vi.fn();
+    const dispatch = vi.fn(() => Promise.resolve());
+    const getters = {
+      GET_PLAYER_INITIALIZED_DEFERRED_PROMISE: null,
+      GET_SHOULD_PLAY_ON_LOAD: null,
+    };
+    const rootGetters = {
+      'settings/GET_SLPLAYERVOLUME': 1,
+      'plexclients/GET_ACTIVE_MEDIA_METADATA': { ratingKey: 'episode-2' },
+      'plexclients/GET_ACTIVE_SERVER_ID': 'server-1',
+      'synclounge/GET_HOST_USER': { state: 'paused' },
+    };
+
+    await slplayerActions.INIT_PLAYER_STATE({
+      getters,
+      rootGetters,
+      commit,
+      dispatch,
+    });
+
+    expect(dispatch).toHaveBeenCalledWith('CHANGE_PLAYER_SRC');
+    expect(dispatch).not.toHaveBeenCalledWith('PRESS_PLAY');
+    expect(commit).toHaveBeenCalledWith('SET_SHOULD_PLAY_ON_LOAD', null);
+    expect(dispatch).toHaveBeenCalledWith('START_PERIODIC_PLEX_TIMELINE_UPDATE');
+    expect(commit).toHaveBeenCalledWith('SET_IS_PLAYER_INITIALIZED', true);
+  });
+
+  it('honors explicit play intent while initialized under a paused host', async () => {
+    const commit = vi.fn();
+    const dispatch = vi.fn(() => Promise.resolve());
+    const getters = {
+      GET_PLAYER_INITIALIZED_DEFERRED_PROMISE: null,
+      GET_SHOULD_PLAY_ON_LOAD: true,
+    };
+    const rootGetters = {
+      'settings/GET_SLPLAYERVOLUME': 1,
+      'plexclients/GET_ACTIVE_MEDIA_METADATA': { ratingKey: 'episode-2' },
+      'plexclients/GET_ACTIVE_SERVER_ID': 'server-1',
+      'synclounge/GET_HOST_USER': { state: 'paused' },
+    };
+
+    await slplayerActions.INIT_PLAYER_STATE({
+      getters,
+      rootGetters,
+      commit,
+      dispatch,
+    });
+
+    expect(dispatch).toHaveBeenCalledWith('CHANGE_PLAYER_SRC');
+    expect(dispatch).toHaveBeenCalledWith('PRESS_PLAY');
+    expect(commit).toHaveBeenCalledWith('SET_SHOULD_PLAY_ON_LOAD', null);
+    expect(dispatch).toHaveBeenCalledWith('START_PERIODIC_PLEX_TIMELINE_UPDATE');
+  });
+});
+
+describe('autoplay recovery', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('unmute retry clears autoplay block and attempts playback again', async () => {
+    const mediaElement = { muted: true };
+    const { getMediaElement } = await import('@/player');
+    getMediaElement.mockReturnValue(mediaElement);
+    const commit = vi.fn();
+    const dispatch = vi.fn().mockResolvedValue(undefined);
+
+    await slplayerActions.UNMUTE_AFTER_AUTOPLAY_BLOCK({ commit, dispatch });
+
+    expect(mediaElement.muted).toBe(false);
+    expect(commit).toHaveBeenCalledWith('SET_AUTOPLAY_BLOCKED', false);
+    expect(dispatch).toHaveBeenCalledWith('PRESS_PLAY');
+  });
+
+  it('keeps the unmute prompt available when the muted retry also fails', async () => {
+    const mediaElement = { muted: false };
+    const { getMediaElement, play } = await import('@/player');
+    getMediaElement.mockReturnValue(mediaElement);
+    play.mockResolvedValueOnce(false).mockResolvedValueOnce(false);
+    const commit = vi.fn();
+
+    await slplayerActions.PRESS_PLAY({ commit });
+
+    expect(mediaElement.muted).toBe(true);
+    expect(commit).toHaveBeenCalledWith('SET_AUTOPLAY_BLOCKED', true);
+  });
+
+  it('stop clears stale autoplay block state and unmutes autoplay-muted media', async () => {
+    const mediaElement = { muted: true };
+    const { getMediaElement } = await import('@/player');
+    getMediaElement.mockReturnValue(mediaElement);
+    const commit = vi.fn();
+    const dispatch = vi.fn().mockResolvedValue(undefined);
+    const getters = { IS_AUTOPLAY_BLOCKED: true };
+
+    await slplayerActions.PRESS_STOP({ getters, commit, dispatch });
+
+    expect(mediaElement.muted).toBe(false);
+    expect(commit).toHaveBeenCalledWith('SET_AUTOPLAY_BLOCKED', false);
+    expect(dispatch).toHaveBeenCalledWith('CHANGE_PLAYER_STATE', 'stopped');
+  });
+});
 
 describe('SPEED_SEEK', () => {
   beforeEach(() => {
@@ -155,6 +315,77 @@ describe('SPEED_SEEK', () => {
   });
 });
 
+describe('NORMAL_SEEK', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('registers the seeked listener before setting currentTime so fast seeks cannot strand sync tokens', async () => {
+    // eslint-disable-next-line new-cap
+    const cancelToken = new CAF.cancelToken();
+    const rootGetters = { GET_CONFIG: { slplayer_seek_timeout: 15000 } };
+    const commit = vi.fn();
+
+    await slplayerActions.NORMAL_SEEK(
+      { rootGetters, commit },
+      { cancelSignal: cancelToken.signal, seekToMs: 1000 },
+    );
+
+    expect(waitForMediaElementEvent).toHaveBeenCalledWith({
+      signal: expect.anything(),
+      type: 'seeked',
+    });
+    expect(setCurrentTimeMs).toHaveBeenCalledWith(1000);
+    expect(waitForMediaElementEvent.mock.invocationCallOrder[0])
+      .toBeLessThan(setCurrentTimeMs.mock.invocationCallOrder[0]);
+  });
+
+  it('falls back after a short settle period only if current time reached the target', async () => {
+    vi.useFakeTimers();
+    waitForMediaElementEvent.mockReturnValueOnce(new Promise(() => {}));
+    getCurrentTimeMs.mockReturnValueOnce(1000);
+    // eslint-disable-next-line new-cap
+    const cancelToken = new CAF.cancelToken();
+    const rootGetters = { GET_CONFIG: { slplayer_seek_timeout: 15000 } };
+    const commit = vi.fn();
+
+    const promise = slplayerActions.NORMAL_SEEK(
+      { rootGetters, commit },
+      { cancelSignal: cancelToken.signal, seekToMs: 1000 },
+    );
+
+    await vi.advanceTimersByTimeAsync(600);
+    await expect(promise).resolves.toBeUndefined();
+    expect(setCurrentTimeMs).toHaveBeenCalledWith(1000);
+    vi.useRealTimers();
+  });
+
+  it('waits for delayed seeked events when current time has not settled at fallback time', async () => {
+    vi.useFakeTimers();
+    let resolveSeeked;
+    waitForMediaElementEvent.mockReturnValueOnce(new Promise((resolve) => { resolveSeeked = resolve; }));
+    getCurrentTimeMs.mockReturnValueOnce(0);
+    // eslint-disable-next-line new-cap
+    const cancelToken = new CAF.cancelToken();
+    const rootGetters = { GET_CONFIG: { slplayer_seek_timeout: 15000 } };
+    const commit = vi.fn();
+    let resolved = false;
+
+    const promise = slplayerActions.NORMAL_SEEK(
+      { rootGetters, commit },
+      { cancelSignal: cancelToken.signal, seekToMs: 1000 },
+    ).then(() => { resolved = true; });
+
+    await vi.advanceTimersByTimeAsync(600);
+    expect(resolved).toBe(false);
+
+    resolveSeeked();
+    await promise;
+    expect(resolved).toBe(true);
+    vi.useRealTimers();
+  });
+});
+
 describe('SPEED_OR_NORMAL_SEEK', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -185,12 +416,65 @@ describe('SPEED_OR_NORMAL_SEEK', () => {
     expect(result).toBe('Skipped seek: player is buffering');
   });
 
-  it('allows speed seek when player is playing and difference within threshold', async () => {
+  it('normal seeks multi-second drift instead of speeding playback for a long catch-up', async () => {
+    // eslint-disable-next-line new-cap
+    const cancelToken = new CAF.cancelToken();
+    const dispatch = vi.fn().mockImplementation((action) => {
+      if (action === 'FETCH_PLAYER_CURRENT_TIME_MS_OR_FALLBACK') return Promise.resolve(0);
+      return Promise.resolve('normal-seek-result');
+    });
+    const getters = { GET_PLAYER_STATE: 'playing' };
+    const rootGetters = {
+      GET_CONFIG: {
+        slplayer_speed_sync_max_diff: 10000,
+        slplayer_speed_sync_max_correction: 500,
+      },
+    };
+
+    await slplayerActions.SPEED_OR_NORMAL_SEEK(
+      { dispatch, getters, rootGetters },
+      { cancelSignal: cancelToken.signal, seekToMs: 5000 },
+    );
+
+    expect(dispatch).toHaveBeenCalledWith('NORMAL_SEEK', {
+      cancelSignal: cancelToken.signal,
+      seekToMs: 5000,
+    });
+    expect(dispatch).not.toHaveBeenCalledWith('SPEED_SEEK', expect.anything());
+  });
+
+  it('uses speed seek for tiny drift within the correction window while playing', async () => {
     // eslint-disable-next-line new-cap
     const cancelToken = new CAF.cancelToken();
     const dispatch = vi.fn().mockImplementation((action) => {
       if (action === 'FETCH_PLAYER_CURRENT_TIME_MS_OR_FALLBACK') return Promise.resolve(0);
       return Promise.resolve('speed-seek-result');
+    });
+    const getters = { GET_PLAYER_STATE: 'playing' };
+    const rootGetters = {
+      GET_CONFIG: {
+        slplayer_speed_sync_max_correction: 500,
+      },
+    };
+
+    await slplayerActions.SPEED_OR_NORMAL_SEEK(
+      { dispatch, getters, rootGetters },
+      { cancelSignal: cancelToken.signal, seekToMs: 300 },
+    );
+
+    expect(dispatch).toHaveBeenCalledWith('SPEED_SEEK', {
+      cancelSignal: cancelToken.signal,
+      seekToMs: 300,
+    });
+    expect(dispatch).not.toHaveBeenCalledWith('NORMAL_SEEK', expect.anything());
+  });
+
+  it('defaults the speed correction window to sub-second drift when no explicit cap is configured', async () => {
+    // eslint-disable-next-line new-cap
+    const cancelToken = new CAF.cancelToken();
+    const dispatch = vi.fn().mockImplementation((action) => {
+      if (action === 'FETCH_PLAYER_CURRENT_TIME_MS_OR_FALLBACK') return Promise.resolve(0);
+      return Promise.resolve('normal-seek-result');
     });
     const getters = { GET_PLAYER_STATE: 'playing' };
     const rootGetters = {
@@ -204,9 +488,10 @@ describe('SPEED_OR_NORMAL_SEEK', () => {
       { cancelSignal: cancelToken.signal, seekToMs: 5000 },
     );
 
-    expect(dispatch).toHaveBeenCalledWith('SPEED_SEEK', {
+    expect(dispatch).toHaveBeenCalledWith('NORMAL_SEEK', {
       cancelSignal: cancelToken.signal,
       seekToMs: 5000,
     });
+    expect(dispatch).not.toHaveBeenCalledWith('SPEED_SEEK', expect.anything());
   });
 });

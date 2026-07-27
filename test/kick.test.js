@@ -121,4 +121,38 @@ describe('kick socket event', () => {
       guest.socket.close();
     }
   });
+
+  it('assigns party-pause request IDs and broadcasts host acknowledgments', async () => {
+    const roomId = `party-pause-${Date.now()}`;
+    const host = await joinClient({ roomId, username: 'host' });
+    const guest = await joinClient({ roomId, username: 'guest' });
+
+    try {
+      const commandPromise = waitForSocketEvent(host.socket, 'partyPause');
+      guest.socket.emit('partyPause', false);
+      const command = await commandPromise;
+
+      assert.equal(command.senderId, guest.socket.id);
+      assert.equal(command.isPause, false);
+      assert.equal(typeof command.requestId, 'string');
+
+      const ackPromise = waitForSocketEvent(guest.socket, 'partyPauseAck');
+      host.socket.emit('partyPauseAck', { requestId: command.requestId });
+      assert.deepEqual(await ackPromise, { requestId: command.requestId });
+
+      const newHostPromise = waitForSocketEvent(host.socket, 'newHost');
+      host.socket.emit('transferHost', guest.socket.id);
+      await newHostPromise;
+
+      let lateAckBroadcast = false;
+      guest.socket.once('partyPauseAck', () => { lateAckBroadcast = true; });
+      host.socket.emit('partyPauseAck', { requestId: command.requestId });
+      await wait(100);
+      assert.equal(host.socket.connected, true);
+      assert.equal(lateAckBroadcast, false);
+    } finally {
+      host.socket.close();
+      guest.socket.close();
+    }
+  });
 });

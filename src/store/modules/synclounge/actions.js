@@ -3,16 +3,22 @@ import eventhandlers from '@/store/modules/synclounge/eventhandlers';
 import { combineUrl, combineRelativeUrlParts } from '@/utils/combineurl';
 import { fetchJson } from '@/utils/fetchutils';
 import {
-  open, close, on, off, waitForEvent, isConnected, emit,
+  open, close, on, off, waitForEvent, isConnected, hasSocket, emit,
 } from '@/socket';
 import notificationSound from '@/assets/sounds/notification_simple-01.wav';
 
 const notificationAudio = new Audio(notificationSound);
 
-// Grace period after sending a party pause — prevents sync from immediately undoing the
-// local pause/play before the message reaches the host
-let lastPartyPauseTime = 0;
-const PARTY_PAUSE_GRACE_MS = 5000;
+// Hold the requested party-pause state until the host confirms the matching command.
+let pendingPartyPause = null;
+let pendingPartyPauseFallbackTimeout = null;
+const clearPendingPartyPause = () => {
+  if (pendingPartyPauseFallbackTimeout != null) {
+    clearTimeout(pendingPartyPauseFallbackTimeout);
+    pendingPartyPauseFallbackTimeout = null;
+  }
+  pendingPartyPause = null;
+};
 
 // Cooldown after buffering ends — prevents aggressive sync from causing rebuffering loop.
 // The periodic 5s poll will handle sync after the player stabilizes.
@@ -23,19 +29,30 @@ const POST_BUFFERING_COOLDOWN_MS = 5000;
 let visibilityChangeHandler = null;
 
 export default {
-  CONNECT_AND_JOIN_ROOM: async ({ dispatch }) => {
+  CONNECT_AND_JOIN_ROOM: async ({ dispatch }, options) => {
     await dispatch('ESTABLISH_SOCKET_CONNECTION');
-    await dispatch('JOIN_ROOM_AND_INIT');
+    await dispatch('JOIN_ROOM_AND_INIT', options);
   },
 
-  SET_AND_CONNECT_AND_JOIN_ROOM: ({ commit, dispatch }, { server, room }) => {
+  SET_AND_CONNECT_AND_JOIN_ROOM: async (
+    { commit, dispatch, rootGetters = {} },
+    { server, room, syncOnJoin = true },
+  ) => {
+    await dispatch('DISCONNECT_IF_CONNECTED');
+
     commit('SET_SERVER', server);
     commit('SET_ROOM', room);
-    return dispatch('CONNECT_AND_JOIN_ROOM');
+
+    if (rootGetters['plex/GET_PLEX_AUTH_TOKEN']) {
+      await dispatch('plex/FETCH_PLEX_USER', null, { root: true });
+      await dispatch('plex/FETCH_PLEX_DEVICES', null, { root: true });
+    }
+
+    return dispatch('CONNECT_AND_JOIN_ROOM', { syncOnJoin });
   },
 
   DISCONNECT_IF_CONNECTED: async ({ dispatch }) => {
-    if (isConnected()) {
+    if (isConnected() || hasSocket()) {
       await dispatch('DISCONNECT');
     }
   },
@@ -98,26 +115,60 @@ export default {
 
   JOIN_ROOM_AND_INIT: async ({
     getters, rootGetters, dispatch, commit,
-  }) => {
+  }, { syncOnJoin = true } = {}) => {
     // Note: this is also called on rejoining, so be careful not to register handlers twice
     // or duplicate tasks
+    const joinStartRevision = getters.GET_USER_EVENT_REVISION || 0;
     const {
       user: { id, ...rest }, users, isPartyPausingEnabled, isAutoHostEnabled, hostId,
     } = await dispatch('JOIN_ROOM');
+    clearPendingPartyPause();
+    await dispatch('CLEAR_HOST_GRACE_PERIOD');
+    await dispatch('CLEAR_HOST_RESTORE_PENDING');
     const updatedAt = Date.now();
+    const currentUsers = getters.GET_USERS;
+    const eventRevisions = getters.GET_USER_EVENT_REVISIONS || {};
 
     commit('SET_HOST_ID', hostId);
 
+    // Apply the snapshot without discarding socket events processed while JOIN_ROOM was pending.
     commit('SET_USERS', Object.fromEntries(
-      Object.entries(users).map(([socketid, data]) => {
-        const existing = getters.GET_USER(socketid);
-        return [socketid, {
-          ...data,
-          ...(existing || {}),
-          updatedAt: existing?.updatedAt || updatedAt,
-        }];
-      }),
+      [
+        ...Object.entries(users)
+          .filter(([socketId]) => {
+            const membershipChanged = eventRevisions[socketId]?.membership > joinStartRevision;
+            return !membershipChanged || currentUsers[socketId];
+          })
+          .map(([socketId, data]) => {
+            const current = currentUsers[socketId];
+            const revisions = eventRevisions[socketId] || {};
+            const membershipChanged = revisions.membership > joinStartRevision;
+            const receivedPlayerUpdate = revisions.player > joinStartRevision;
+            const receivedMediaUpdate = revisions.media > joinStartRevision;
+            const receivedSyncFlexibilityUpdate = revisions.syncFlexibility > joinStartRevision;
+            return [socketId, {
+              ...(membershipChanged ? current : data),
+              ...(receivedPlayerUpdate ? {
+                state: current.state,
+                time: current.time,
+                duration: current.duration,
+                playbackRate: current.playbackRate,
+              } : {}),
+              ...(receivedMediaUpdate ? { media: current.media } : {}),
+              ...(receivedSyncFlexibilityUpdate
+                ? { syncFlexibility: current.syncFlexibility }
+                : {}),
+              updatedAt: membershipChanged || receivedPlayerUpdate
+                ? current.updatedAt
+                : updatedAt,
+            }];
+          }),
+        ...Object.entries(currentUsers)
+          .filter(([socketId]) => !users[socketId]
+            && eventRevisions[socketId]?.membership > joinStartRevision),
+      ],
     ));
+    commit('RESET_USER_EVENTS');
 
     // Add ourselves to user list
     commit('SET_USER', {
@@ -142,36 +193,40 @@ export default {
       color: 'success',
     }, { root: true });
 
-    commit('SET_JOIN_SYNC_IN_PROGRESS', true);
-    try {
-      await dispatch('SYNC_MEDIA_AND_PLAYER_STATE');
-    } finally {
-      commit('SET_JOIN_SYNC_IN_PROGRESS', false);
-    }
-
-    // Schedule a delayed re-sync to catch up after initial media load settles
-    setTimeout(() => {
-      if (getters.IS_IN_ROOM) {
-        dispatch('SYNC_MEDIA_AND_PLAYER_STATE');
+    if (syncOnJoin) {
+      commit('SET_JOIN_SYNC_IN_PROGRESS', true);
+      try {
+        await dispatch('SYNC_MEDIA_AND_PLAYER_STATE');
+      } finally {
+        commit('SET_JOIN_SYNC_IN_PROGRESS', false);
       }
-    }, 2000);
 
-    // Start periodic sync polling to correct drift during continuous playback
-    dispatch('START_SYNC_POLL_INTERVAL');
+      // Schedule a delayed re-sync to catch up after initial media load settles
+      setTimeout(() => {
+        if (getters.IS_IN_ROOM) {
+          dispatch('SYNC_MEDIA_AND_PLAYER_STATE');
+        }
+      }, 2000);
 
-    // Re-sync when the tab becomes visible again (Chrome pauses video in background tabs)
-    if (visibilityChangeHandler) {
-      document.removeEventListener('visibilitychange', visibilityChangeHandler);
-    }
-    visibilityChangeHandler = () => {
-      if (document.visibilityState === 'visible' && getters.IS_IN_ROOM && !getters.AM_I_HOST) {
-        dispatch('SYNC_MEDIA_AND_PLAYER_STATE');
+      // Start periodic sync polling to correct drift during continuous playback
+      dispatch('START_SYNC_POLL_INTERVAL');
+
+      // Re-sync when the tab becomes visible again (Chrome pauses video in background tabs)
+      if (visibilityChangeHandler) {
+        document.removeEventListener('visibilitychange', visibilityChangeHandler);
       }
-    };
-    document.addEventListener('visibilitychange', visibilityChangeHandler);
+      visibilityChangeHandler = () => {
+        if (document.visibilityState === 'visible' && getters.IS_IN_ROOM && !getters.AM_I_HOST) {
+          dispatch('SYNC_MEDIA_AND_PLAYER_STATE');
+        }
+      };
+      document.addEventListener('visibilitychange', visibilityChangeHandler);
+    }
   },
 
   DISCONNECT: async ({ commit, dispatch }) => {
+    await dispatch('INVALIDATE_PARTY_PAUSE_COMMANDS');
+    clearPendingPartyPause();
     await dispatch('CANCEL_IN_PROGRESS_SYNC');
     await dispatch('CANCEL_UPNEXT');
     await dispatch('STOP_SYNC_POLL_INTERVAL');
@@ -184,10 +239,12 @@ export default {
 
     // Clean up host grace period timer
     await dispatch('CLEAR_HOST_GRACE_PERIOD');
+    await dispatch('CLEAR_HOST_RESTORE_PENDING');
 
     close();
     commit('SET_IS_IN_ROOM', false);
     commit('SET_USERS', {});
+    commit('RESET_USER_EVENTS');
     commit('SET_HOST_ID', null);
     commit('SET_SERVER', null);
     commit('SET_ROOM', null);
@@ -235,12 +292,48 @@ export default {
     });
   },
 
-  sendPartyPause: ({ getters }, isPause) => {
+  sendPartyPause: async ({ getters, dispatch }, isPause) => {
     if (!getters.AM_I_HOST && getters.IS_PARTY_PAUSING_ENABLED) {
-      lastPartyPauseTime = Date.now();
+      await dispatch('MARK_PARTY_PAUSE_RECEIVED', { isPause, requestId: null });
       emit({
         eventName: 'partyPause',
         data: isPause,
+      });
+    }
+  },
+
+  MARK_PARTY_PAUSE_RECEIVED: (context, { isPause, requestId }) => {
+    clearPendingPartyPause();
+    pendingPartyPause = {
+      requestId,
+      state: isPause ? 'paused' : 'playing',
+    };
+
+    // Preserve legacy-server behavior while preventing a missing current-server ack
+    // from suppressing synchronization indefinitely.
+    pendingPartyPauseFallbackTimeout = setTimeout(
+      clearPendingPartyPause,
+      requestId ? 30000 : 5000,
+    );
+  },
+
+  CLEAR_PENDING_PARTY_PAUSE: () => {
+    clearPendingPartyPause();
+  },
+
+  ACKNOWLEDGE_PARTY_PAUSE: (context, requestId) => {
+    if (!requestId || pendingPartyPause?.requestId !== requestId) {
+      return false;
+    }
+    clearPendingPartyPause();
+    return true;
+  },
+
+  SEND_PARTY_PAUSE_ACK: (context, requestId) => {
+    if (requestId) {
+      emit({
+        eventName: 'partyPauseAck',
+        data: { requestId },
       });
     }
   },
@@ -282,7 +375,7 @@ export default {
       'userJoined', 'userLeft', 'newHost', 'newMessage', 'slPing',
       'playerStateUpdate', 'mediaUpdate', 'syncFlexibilityUpdate',
       'setPartyPausingEnabled', 'setAutoHostEnabled', 'partyPause',
-      'disconnect', 'connect', 'kicked',
+      'partyPauseAck', 'disconnect', 'connect', 'kicked',
     ];
     eventNames.forEach((eventName) => off({ eventName }));
   },
@@ -319,6 +412,7 @@ export default {
       action: 'HANDLE_SET_AUTO_HOST_ENABLED',
     });
     registerListener({ eventName: 'partyPause', action: 'HANDLE_PARTY_PAUSE' });
+    registerListener({ eventName: 'partyPauseAck', action: 'HANDLE_PARTY_PAUSE_ACK' });
     registerListener({ eventName: 'disconnect', action: 'HANDLE_DISCONNECT' });
     registerListener({ eventName: 'connect', action: 'HANDLE_RECONNECT' });
     registerListener({ eventName: 'kicked', action: 'HANDLE_KICKED' });
@@ -547,16 +641,11 @@ export default {
     console.debug('MANUAL_SYNC');
     await dispatch('CANCEL_IN_PROGRESS_SYNC');
 
-    const offset = getters.GET_ADJUSTED_HOST_TIME();
-
     // eslint-disable-next-line new-cap
     const token = new CAF.cancelToken();
     commit('SET_SYNC_CANCEL_TOKEN', token);
     try {
-      await dispatch('plexclients/SEEK_TO', {
-        cancelSignal: token.signal,
-        offset,
-      }, { root: true });
+      await dispatch('plexclients/SYNC', token.signal, { root: true });
     } catch (e) {
       if (!token.signal.aborted) {
         console.error('Error in manual sync:', e);
@@ -582,7 +671,8 @@ export default {
   },
 
   SYNC_MEDIA_AND_PLAYER_STATE: async ({ getters, commit, dispatch }) => {
-    if (getters.AM_I_HOST || getters.GET_SYNC_CANCEL_TOKEN || getters.IS_HOST_GRACE_PERIOD) {
+    if (getters.AM_I_HOST || getters.GET_SYNC_CANCEL_TOKEN || getters.IS_HOST_GRACE_PERIOD
+      || getters.GET_HOST_RESTORE_PENDING_ID) {
       return;
     }
 
@@ -701,7 +791,8 @@ export default {
   },
 
   SYNC_PLAYER_STATE: async ({ dispatch, getters, commit }) => {
-    if (getters.AM_I_HOST || getters.GET_SYNC_CANCEL_TOKEN || getters.IS_HOST_GRACE_PERIOD) {
+    if (getters.AM_I_HOST || getters.GET_SYNC_CANCEL_TOKEN || getters.IS_HOST_GRACE_PERIOD
+      || getters.GET_HOST_RESTORE_PENDING_ID) {
       return;
     }
 
@@ -734,7 +825,7 @@ export default {
   },
 
   // Private version without lock. Please use the locking version unless you know what you are doing
-  _SYNC_PLAYER_STATE: async ({ getters, rootGetters, dispatch }, cancelSignal) => {
+  _SYNC_PLAYER_STATE: async ({ getters, dispatch }, cancelSignal) => {
     if (!getters.GET_HOST_USER) {
       return;
     }
@@ -759,20 +850,13 @@ export default {
       return;
     }
 
-    // Don't override local play/pause state during party pause grace period —
-    // the party pause message needs time to reach the host and propagate back
-    const inPartyPauseGrace = (Date.now() - lastPartyPauseTime) < PARTY_PAUSE_GRACE_MS;
+    if (pendingPartyPause) {
+      console.debug('_SYNC_PLAYER_STATE: waiting for host party pause confirmation');
+      return;
+    }
 
     if (hostUser.state === 'playing'
       && timeline.state === 'paused') {
-      if (inPartyPauseGrace) {
-        console.debug('_SYNC_PLAYER_STATE: skipping resume during party pause grace period');
-        return;
-      }
-      if (rootGetters['slplayer/IS_AUTOPLAY_BLOCKED']) {
-        console.debug('_SYNC_PLAYER_STATE: skipping resume because autoplay is blocked');
-        return;
-      }
       await dispatch('DISPLAY_NOTIFICATION', {
         text: 'Resuming..',
         color: 'info',
@@ -782,10 +866,6 @@ export default {
     }
 
     if (hostUser.state === 'paused' && timeline.state === 'playing') {
-      if (inPartyPauseGrace) {
-        console.debug('_SYNC_PLAYER_STATE: skipping pause during party pause grace period');
-        return;
-      }
       await dispatch('DISPLAY_NOTIFICATION', {
         text: 'Pausing..',
         color: 'info',
@@ -807,15 +887,14 @@ export default {
   PLAY_MEDIA_AND_SYNC_TIME: async ({ getters, dispatch }, media) => {
     const offset = getters.GET_ADJUSTED_HOST_TIME();
 
-    dispatch('plexclients/PLAY_MEDIA', {
+    await dispatch('plexclients/PLAY_MEDIA', {
       mediaIndex: media.mediaIndex || 0,
       // TODO: potentially play ahead a bit by the time it takes to buffer / transcode.
       offset: offset || 0,
       metadata: media,
       machineIdentifier: media.machineIdentifier,
-    }, { root: true }).catch((e) => {
-      console.error('Error during PLAY_MEDIA:', e);
-    });
+      shouldPlay: getters.GET_HOST_USER?.state === 'playing',
+    }, { root: true });
   },
 
   REQUEST_ALLOW_NOTIFICATIONS: async ({ commit }) => {
@@ -873,7 +952,7 @@ export default {
 
     const id = setInterval(() => {
       if (!getters.IS_IN_ROOM || getters.AM_I_HOST || getters.GET_SYNC_CANCEL_TOKEN
-        || getters.IS_HOST_GRACE_PERIOD) {
+        || getters.IS_HOST_GRACE_PERIOD || getters.GET_HOST_RESTORE_PENDING_ID) {
         return;
       }
       dispatch('SYNC_PLAYER_STATE');

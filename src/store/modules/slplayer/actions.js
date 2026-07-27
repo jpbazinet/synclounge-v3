@@ -325,27 +325,42 @@ export default {
       const mediaElement = getMediaElement();
       if (mediaElement) {
         mediaElement.muted = true;
-        const retrySuccess = await play();
-        if (retrySuccess) {
-          commit('SET_AUTOPLAY_BLOCKED', true);
-        }
+        commit('SET_AUTOPLAY_BLOCKED', true);
+        await play();
       }
     }
   },
 
-  UNMUTE_AFTER_AUTOPLAY_BLOCK: ({ commit }) => {
+  UNMUTE_AFTER_AUTOPLAY_BLOCK: async ({ commit, dispatch }) => {
     const mediaElement = getMediaElement();
     if (mediaElement) {
       mediaElement.muted = false;
     }
     commit('SET_AUTOPLAY_BLOCKED', false);
+    await dispatch('PRESS_PLAY');
   },
 
   PRESS_PAUSE: () => {
     pause();
   },
 
-  PRESS_STOP: async ({ dispatch }) => {
+  REFRESH_PLAYER_STATE: ({ commit, dispatch }) => {
+    let state = 'playing';
+    if (isPaused()) {
+      state = 'paused';
+    } else if (isBuffering()) {
+      state = 'buffering';
+    }
+    commit('SET_PLAYER_STATE', state);
+    return dispatch('synclounge/PROCESS_PLAYER_STATE_UPDATE', true, { root: true });
+  },
+
+  PRESS_STOP: async ({ getters, commit, dispatch }) => {
+    const mediaElement = getMediaElement();
+    if (getters.IS_AUTOPLAY_BLOCKED && mediaElement) {
+      mediaElement.muted = false;
+    }
+    commit('SET_AUTOPLAY_BLOCKED', false);
     await dispatch('CHANGE_PLAYER_STATE', 'stopped');
   },
 
@@ -405,7 +420,6 @@ export default {
   NORMAL_SEEK: async ({ rootGetters, commit }, { cancelSignal, seekToMs }) => {
     console.debug('NORMAL_SEEK', seekToMs);
     commit('SET_OFFSET_MS', seekToMs);
-    setCurrentTimeMs(seekToMs);
 
     const timeoutToken = CAF.timeout(
       rootGetters.GET_CONFIG.slplayer_seek_timeout,
@@ -422,7 +436,19 @@ export default {
     });
 
     try {
-      await main(anySignal);
+      const seekedPromise = main(anySignal);
+      setCurrentTimeMs(seekToMs);
+      const settleTimeout = rootGetters.GET_CONFIG.slplayer_seek_settle_timeout ?? 500;
+      const settleTolerance = rootGetters.GET_CONFIG.slplayer_seek_settle_tolerance ?? 250;
+      await Promise.race([
+        seekedPromise,
+        CAF.delay(anySignal, settleTimeout).then(() => {
+          if (Math.abs(getCurrentTimeMs() - seekToMs) <= settleTolerance) {
+            return undefined;
+          }
+          return seekedPromise;
+        }),
+      ]);
     } finally {
       timeoutToken.abort();
     }
@@ -437,7 +463,8 @@ export default {
 
     const currentTimeMs = await dispatch('FETCH_PLAYER_CURRENT_TIME_MS_OR_FALLBACK');
     const difference = seekToMs - currentTimeMs;
-    if (Math.abs(difference) <= rootGetters.GET_CONFIG.slplayer_speed_sync_max_diff
+    const maxSpeedCorrection = rootGetters.GET_CONFIG.slplayer_speed_sync_max_correction ?? 500;
+    if (Math.abs(difference) <= maxSpeedCorrection
         && getters.GET_PLAYER_STATE === 'playing') {
       return dispatch('SPEED_SEEK', { cancelSignal, seekToMs });
     }
@@ -526,10 +553,20 @@ export default {
       await dispatch('REGISTER_PLAYER_EVENTS');
       await dispatch('START_UPDATE_PLAYER_CONTROLS_SHOWN_INTERVAL');
       setVolume(rootGetters['settings/GET_SLPLAYERVOLUME']);
-      await dispatch('CHANGE_PLAYER_SRC');
 
-      // Purposefully not awaited
-      dispatch('START_PERIODIC_PLEX_TIMELINE_UPDATE');
+      if (rootGetters['plexclients/GET_ACTIVE_MEDIA_METADATA']
+        && rootGetters['plexclients/GET_ACTIVE_SERVER_ID']) {
+        await dispatch('CHANGE_PLAYER_SRC');
+        const shouldPlayOnLoad = getters.GET_SHOULD_PLAY_ON_LOAD
+          ?? (rootGetters['synclounge/GET_HOST_USER']?.state !== 'paused');
+        if (shouldPlayOnLoad) {
+          await dispatch('PRESS_PLAY');
+        }
+        commit('SET_SHOULD_PLAY_ON_LOAD', null);
+
+        // Purposefully not awaited
+        dispatch('START_PERIODIC_PLEX_TIMELINE_UPDATE');
+      }
 
       if (getters.GET_PLAYER_INITIALIZED_DEFERRED_PROMISE) {
         getters.GET_PLAYER_INITIALIZED_DEFERRED_PROMISE.resolve();
@@ -647,11 +684,13 @@ export default {
     }
     console.debug('slplayer/PLAY_NEXT');
     isPlayQueueTransitioning = true;
+    commit('SET_IS_PLAY_QUEUE_TRANSITIONING', true);
     try {
       commit('plexclients/INCREMENT_ACTIVE_PLAY_QUEUE_SELECTED_ITEM_OFFSET', null, { root: true });
       await dispatch('PLAY_ACTIVE_PLAY_QUEUE_SELECTED_ITEM');
     } finally {
       isPlayQueueTransitioning = false;
+      commit('SET_IS_PLAY_QUEUE_TRANSITIONING', false);
     }
   },
 
@@ -661,11 +700,13 @@ export default {
       return;
     }
     isPlayQueueTransitioning = true;
+    commit('SET_IS_PLAY_QUEUE_TRANSITIONING', true);
     try {
       commit('plexclients/DECREMENT_ACTIVE_PLAY_QUEUE_SELECTED_ITEM_OFFSET', null, { root: true });
       await dispatch('PLAY_ACTIVE_PLAY_QUEUE_SELECTED_ITEM');
     } finally {
       isPlayQueueTransitioning = false;
+      commit('SET_IS_PLAY_QUEUE_TRANSITIONING', false);
     }
   },
 
@@ -687,10 +728,13 @@ export default {
       'SET_OFFSET_MS',
       rootGetters['plexclients/GET_ACTIVE_PLAY_QUEUE_SELECTED_ITEM'].viewOffset || 0,
     );
+    commit('SET_PLAYER_STATE', 'buffering');
     commit('SET_MASK_PLAYER_STATE', true);
     await dispatch('synclounge/PROCESS_MEDIA_UPDATE', true, { root: true });
 
     await dispatch('CHANGE_PLAYER_SRC');
+    await dispatch('PRESS_PLAY');
+    await dispatch('synclounge/PROCESS_MEDIA_UPDATE', true, { root: true });
 
     // Purposefully not awaited
     dispatch('START_PERIODIC_PLEX_TIMELINE_UPDATE');

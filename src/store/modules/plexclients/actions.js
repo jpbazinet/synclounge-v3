@@ -2,7 +2,7 @@ export default {
   PLAY_MEDIA: async ({
     commit, dispatch, rootGetters,
   }, {
-    mediaIndex, offset, metadata, machineIdentifier, userInitiated,
+    mediaIndex, offset, metadata, machineIdentifier, userInitiated, shouldPlay = userInitiated,
   }) => {
     console.debug('PLAY_MEDIA:', {
       title: metadata.title,
@@ -57,9 +57,17 @@ export default {
     commit('slplayer/SET_PLAYER_STATE', 'buffering', { root: true });
     commit('slplayer/SET_MASK_PLAYER_STATE', true, { root: true });
     await dispatch('synclounge/PROCESS_MEDIA_UPDATE', userInitiated, { root: true });
+    commit('slplayer/SET_SHOULD_PLAY_ON_LOAD', Boolean(shouldPlay), { root: true });
 
     if (rootGetters['slplayer/IS_PLAYER_INITIALIZED']) {
       await dispatch('slplayer/CHANGE_PLAYER_SRC', true, { root: true });
+      if (shouldPlay) {
+        await dispatch('slplayer/PRESS_PLAY', null, { root: true });
+      }
+      commit('slplayer/SET_SHOULD_PLAY_ON_LOAD', null, { root: true });
+      if (!rootGetters['slplayer/GET_PLEX_TIMELINE_UPDATER_CANCEL_TOKEN']) {
+        dispatch('slplayer/START_PERIODIC_PLEX_TIMELINE_UPDATE', null, { root: true });
+      }
     } else {
       await dispatch('slplayer/NAVIGATE_AND_INITIALIZE_PLAYER', null, { root: true });
     }
@@ -77,6 +85,10 @@ export default {
 
   SYNC: async ({ dispatch, rootGetters }, cancelSignal) => {
     const playerPollData = await dispatch('FETCH_TIMELINE_POLL_DATA_CACHE');
+    const hostUser = rootGetters['synclounge/GET_HOST_USER'];
+    if (!hostUser) {
+      return undefined;
+    }
     const adjustedHostTime = rootGetters['synclounge/GET_ADJUSTED_HOST_TIME']();
 
     const difference = adjustedHostTime - playerPollData.time;
@@ -85,21 +97,32 @@ export default {
     console.debug('SYNC difference', difference);
 
     if (absDifference > rootGetters['settings/GET_SYNCFLEXIBILITY']
-      || (rootGetters['synclounge/GET_HOST_USER'].state === 'paused'
+      || (hostUser.state === 'paused'
         && absDifference > rootGetters.GET_CONFIG.paused_sync_flexibility)) {
       const offset = adjustedHostTime;
 
       if (rootGetters['settings/GET_SYNCMODE'] === 'cleanseek'
-        || rootGetters['synclounge/GET_HOST_USER'].state === 'paused') {
+        || hostUser.state === 'paused') {
         return dispatch('SEEK_TO', { cancelSignal, offset });
       }
 
       return dispatch('SKIP_AHEAD', { cancelSignal, offset });
     }
 
-    // Skip soft seek — on iOS Safari, setting currentTime directly causes audio decoder resets
-    // (audible clicks/pops) and triggers buffering events that create a feedback loop.
-    // Sub-syncFlexibility differences are imperceptible to viewers.
+    const browserOs = rootGetters.GET_BROWSER?.os;
+    const canSoftSeek = browserOs !== 'iOS' && browserOs !== 'iPadOS';
+    const softSeekThreshold = rootGetters.GET_CONFIG.slplayer_soft_seek_threshold ?? 200;
+    if (canSoftSeek
+      && hostUser.state === 'playing'
+      && playerPollData.state === 'playing'
+      && absDifference > softSeekThreshold) {
+      try {
+        return await dispatch('slplayer/SOFT_SEEK', adjustedHostTime, { root: true });
+      } catch (e) {
+        console.debug('SYNC soft seek skipped:', e.message);
+      }
+    }
+
     return 'No sync needed';
   },
 
@@ -107,12 +130,16 @@ export default {
 
   PRESS_PAUSE: ({ dispatch }) => dispatch('slplayer/PRESS_PAUSE', null, { root: true }),
 
+  REFRESH_PLAYER_STATE: ({ dispatch }) => dispatch('slplayer/REFRESH_PLAYER_STATE', null, {
+    root: true,
+  }),
+
   PRESS_STOP: ({ dispatch }) => dispatch('slplayer/PRESS_STOP', null, { root: true }),
 
   SEEK_TO: ({ dispatch }, { cancelSignal, offset }) => {
     console.debug('SEEK_TO', offset);
     return dispatch(
-      'slplayer/SPEED_OR_NORMAL_SEEK',
+      'slplayer/NORMAL_SEEK',
       { cancelSignal, seekToMs: offset },
       { root: true },
     );

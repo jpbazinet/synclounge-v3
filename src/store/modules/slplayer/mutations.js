@@ -67,6 +67,10 @@ export default {
     state.playerInitializedDeferredPromise = deferred;
   },
 
+  SET_SHOULD_PLAY_ON_LOAD: (state, shouldPlay) => {
+    state.shouldPlayOnLoad = shouldPlay;
+  },
+
   SET_MASK_PLAYER_STATE: (state, mask) => {
     state.maskPlayerState = mask;
   },
@@ -105,6 +109,10 @@ export default {
 
   SET_IS_CHANGING_SOURCE: (state, isChanging) => {
     state.isChangingSource = isChanging;
+  },
+
+  SET_IS_PLAY_QUEUE_TRANSITIONING: (state, isTransitioning) => {
+    state.isPlayQueueTransitioning = isTransitioning;
   },
 
   SET_FORCE_TRANSCODE_RETRY: (state, force) => {
