@@ -6,6 +6,12 @@ import qualities from './qualities';
 
 const buggyChromeBitrate = 23000;
 
+const getQualityParameters = (bitrate) => {
+  if (!bitrate) return {};
+  const resolution = qualities.find((quality) => quality.maxVideoBitrate === bitrate)?.videoResolution;
+  return { maxVideoBitrate: bitrate, ...(resolution && { videoResolution: resolution }) };
+};
+
 export default {
   GET_PLEX_DECISION: (state) => state.plexDecision,
 
@@ -220,7 +226,10 @@ export default {
 
   GET_OFFSET_MS: (state) => state.offsetMs,
 
-  GET_PLAYER_STATE: (state) => state.playerState,
+  // Native pause/playing events can fire while Shaka is still replacing the source.
+  // Do not advertise restored playback (and reclaim host) until that load settles.
+  GET_PLAYER_STATE: (state) => (state.playerState !== 'stopped'
+    && (state.maskPlayerState || state.isChangingSource) ? 'buffering' : state.playerState),
 
   GET_TITLE: (state, getters, rootState, rootGetters) => (
     rootGetters['plexclients/GET_ACTIVE_MEDIA_METADATA']
@@ -319,10 +328,7 @@ export default {
     subtitleSize: 100,
     audioBoost: 100,
     location: getters.GET_PLEX_SERVER_LOCATION,
-    // only include if not null
-    ...rootGetters['settings/GET_SLPLAYERQUALITY'] && {
-      maxVideoBitrate: rootGetters['settings/GET_SLPLAYERQUALITY'],
-    },
+    ...getQualityParameters(rootGetters['settings/GET_SLPLAYERQUALITY']),
     addDebugOverlay: 0,
 
     // TODO: figure out how to make autoAdjustQuality work

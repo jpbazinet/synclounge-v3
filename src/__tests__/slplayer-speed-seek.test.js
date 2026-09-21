@@ -1,14 +1,9 @@
 import {
-  describe, it, expect, vi, beforeEach, afterEach, beforeAll, afterAll,
+  describe, it, expect, vi, beforeEach, afterEach,
 } from 'vitest';
 import { CAF } from 'caf';
 import slplayerActions from '@/store/modules/slplayer/actions';
-
-// CAF's generator abort leaves orphaned CAF.delay rejections that are briefly unhandled
-// before being caught by CAF's internals. Suppress these expected rejections.
-const suppressRejection = () => {};
-beforeAll(() => { process.on('unhandledRejection', suppressRejection); });
-afterAll(() => { process.removeListener('unhandledRejection', suppressRejection); });
+import slplayerGetters from '@/store/modules/slplayer/getters';
 
 vi.mock('@/player', () => ({
   setPlaybackRate: vi.fn(),
@@ -24,6 +19,7 @@ vi.mock('@/player', () => ({
   isPresentationPaused: vi.fn(() => false),
   isBuffering: vi.fn(() => false),
   getVolume: vi.fn(() => 1),
+  getPlaybackDiagnostics: vi.fn(() => ({ bufferAhead: 0, shaka: {} })),
   isPaused: vi.fn(() => false),
   destroy: vi.fn(),
   cancelTrickPlay: vi.fn(),
@@ -171,6 +167,87 @@ describe('INIT_PLAYER_STATE', () => {
     expect(commit).toHaveBeenCalledWith('SET_SHOULD_PLAY_ON_LOAD', null);
     expect(dispatch).toHaveBeenCalledWith('START_PERIODIC_PLEX_TIMELINE_UPDATE');
   });
+
+  it('rolls back partial initialization and propagates the failure', async () => {
+    const error = new Error('media load failed');
+    const commit = vi.fn();
+    const dispatch = vi.fn((type) => {
+      if (type === 'CHANGE_PLAYER_SRC') return Promise.reject(error);
+      return Promise.resolve();
+    });
+    const getters = {
+      GET_PLAYER_INITIALIZED_DEFERRED_PROMISE: null,
+      GET_SHOULD_PLAY_ON_LOAD: null,
+    };
+    const rootGetters = {
+      'settings/GET_SLPLAYERVOLUME': 1,
+      'plexclients/GET_ACTIVE_MEDIA_METADATA': { ratingKey: 'episode-2' },
+      'plexclients/GET_ACTIVE_SERVER_ID': 'server-1',
+      'synclounge/GET_HOST_USER': { state: 'playing' },
+    };
+
+    await expect(slplayerActions.INIT_PLAYER_STATE({
+      getters,
+      rootGetters,
+      commit,
+      dispatch,
+    })).rejects.toThrow('media load failed');
+
+    expect(dispatch).toHaveBeenCalledWith('ROLLBACK_PLAYER_INITIALIZATION');
+    expect(commit).not.toHaveBeenCalledWith('SET_IS_PLAYER_INITIALIZED', true);
+  });
+
+  it('releases partial player resources during rollback', async () => {
+    const abort = vi.fn();
+    const commit = vi.fn();
+    const dispatch = vi.fn().mockResolvedValue(undefined);
+    const { destroy } = await import('@/player');
+
+    await slplayerActions.ROLLBACK_PLAYER_INITIALIZATION({
+      getters: { GET_PLAYER_DESTROY_CANCEL_TOKEN: { abort } },
+      commit,
+      dispatch,
+    });
+
+    expect(abort).toHaveBeenCalledOnce();
+    expect(dispatch).toHaveBeenCalledWith('UNREGISTER_PLAYER_EVENTS');
+    expect(dispatch).toHaveBeenCalledWith('CANCEL_PERIODIC_PLEX_TIMELINE_UPDATE');
+    expect(dispatch).toHaveBeenCalledWith('DESTROY_SUBTITLES');
+    expect(destroy).toHaveBeenCalledOnce();
+    expect(commit).toHaveBeenCalledWith('SET_IS_PLAYER_INITIALIZED', false);
+  });
+
+  it('finishes rollback after cleanup failures and remains repeatable', async () => {
+    const cleanupError = new Error('event cleanup failed');
+    const commit = vi.fn();
+    let shouldRejectCleanup = true;
+    const dispatch = vi.fn((type) => {
+      if (type === 'UNREGISTER_PLAYER_EVENTS' && shouldRejectCleanup) {
+        shouldRejectCleanup = false;
+        return Promise.reject(cleanupError);
+      }
+      return Promise.resolve();
+    });
+    const { destroy } = await import('@/player');
+
+    await expect(slplayerActions.ROLLBACK_PLAYER_INITIALIZATION({
+      getters: {},
+      commit,
+      dispatch,
+    })).resolves.toBeUndefined();
+    await expect(slplayerActions.ROLLBACK_PLAYER_INITIALIZATION({
+      getters: {},
+      commit,
+      dispatch,
+    })).resolves.toBeUndefined();
+
+    expect(dispatch).toHaveBeenCalledWith('CANCEL_PERIODIC_PLEX_TIMELINE_UPDATE');
+    expect(dispatch).toHaveBeenCalledWith('DESTROY_SUBTITLES');
+    expect(destroy).toHaveBeenCalledTimes(2);
+    expect(commit).toHaveBeenCalledWith('SET_IS_PLAYER_INITIALIZED', false);
+    expect(commit.mock.calls.filter(([type]) => type === 'SET_IS_PLAYER_INITIALIZED'))
+      .toHaveLength(2);
+  });
 });
 
 describe('autoplay recovery', () => {
@@ -267,6 +344,7 @@ describe('SPEED_SEEK', () => {
       { dispatch, rootGetters },
       { cancelSignal: cancelToken.signal, seekToMs: 100000 },
     );
+    const rejection = expect(promise).rejects.toThrow();
 
     // Flush microtasks so the generator starts and setPlaybackRate(rate) runs
     await vi.advanceTimersByTimeAsync(100);
@@ -277,7 +355,7 @@ describe('SPEED_SEEK', () => {
     // Flush so the abort propagates through CAF
     await vi.advanceTimersByTimeAsync(0);
 
-    await expect(promise).rejects.toThrow();
+    await rejection;
 
     // Rate must still be reset to 1 in the finally block
     expect(setPlaybackRate).toHaveBeenLastCalledWith(1);
@@ -300,6 +378,7 @@ describe('SPEED_SEEK', () => {
       { dispatch, rootGetters },
       { cancelSignal: cancelToken.signal, seekToMs: 1000 },
     );
+    const rejection = expect(promise).rejects.toThrow();
 
     // Let generator start
     await vi.advanceTimersByTimeAsync(100);
@@ -309,7 +388,7 @@ describe('SPEED_SEEK', () => {
 
     // Should reject from CAF abort, but NOT leave an unhandled rejection
     // from PROCESS_STATE_UPDATE_ON_PLAYER_EVENT (handled by .catch(() => {}))
-    await expect(promise).rejects.toThrow();
+    await rejection;
 
     expect(setPlaybackRate).toHaveBeenLastCalledWith(1);
   });
@@ -493,5 +572,133 @@ describe('SPEED_OR_NORMAL_SEEK', () => {
       seekToMs: 5000,
     });
     expect(dispatch).not.toHaveBeenCalledWith('SPEED_SEEK', expect.anything());
+  });
+});
+
+describe('Source request cancellation', () => {
+  it('keeps early native pause events buffering until source loading has settled', async () => {
+    const state = { playerState: 'buffering', maskPlayerState: true, isChangingSource: false };
+    const getters = {
+      get GET_PLAYER_STATE() { return slplayerGetters.GET_PLAYER_STATE(state); },
+      get GET_MASK_PLAYER_STATE() { return state.maskPlayerState; },
+    };
+    const controller = new AbortController();
+    let finishLoad;
+    const commit = (type, value) => {
+      if (type === 'SET_PLAYER_STATE') state.playerState = value;
+      if (type === 'SET_MASK_PLAYER_STATE') state.maskPlayerState = value;
+      if (type === 'SET_IS_CHANGING_SOURCE') state.isChangingSource = value;
+    };
+    const reports = [];
+    const dispatch = vi.fn(async (type, value) => {
+      if (type === 'LOAD_PLAYER_SRC') await new Promise((resolve) => { finishLoad = resolve; });
+      if (type === 'REFRESH_PLAYER_STATE') {
+        await slplayerActions.REFRESH_PLAYER_STATE({ commit, dispatch });
+      }
+      if (type === 'synclounge/PROCESS_PLAYER_STATE_UPDATE') {
+        const timeline = await slplayerActions.FETCH_TIMELINE_POLL_DATA({ getters, dispatch });
+        reports.push(timeline.state);
+        // A stable timeline can immediately trigger host reclamation and cancel follower sync.
+        if (timeline.state === 'paused') controller.abort();
+      }
+      if (type === 'CHANGE_PLAYER_STATE') {
+        await slplayerActions.CHANGE_PLAYER_STATE({ commit, dispatch }, value);
+      }
+    });
+    const { unload } = await import('@/player');
+    unload.mockClear();
+    isPaused.mockReturnValue(true);
+    const pending = slplayerActions.CHANGE_PLAYER_SRC({ getters, commit, dispatch }, {
+      signal: controller.signal,
+    });
+    await vi.waitFor(() => expect(finishLoad).toBeTypeOf('function'));
+    await slplayerActions.HANDLE_PLAYER_BUFFERING({ getters, dispatch }, { buffering: false });
+    await slplayerActions.REFRESH_PLAYER_STATE({ commit, dispatch });
+    expect(reports).toEqual(['buffering', 'buffering']);
+    expect(controller.signal.aborted).toBe(false);
+    finishLoad();
+    await pending;
+    expect(reports).toEqual(['buffering', 'buffering', 'paused']);
+    expect(state.isChangingSource).toBe(false);
+    expect(state.maskPlayerState).toBe(false);
+    expect(controller.signal.aborted).toBe(true);
+    expect(unload).not.toHaveBeenCalled();
+  });
+
+  it('preserves explicit stopped state during source cancellation', () => {
+    expect(slplayerGetters.GET_PLAYER_STATE({
+      playerState: 'stopped', maskPlayerState: true, isChangingSource: true,
+    })).toBe('stopped');
+  });
+
+  it('does not commit a decision response after cancellation', async () => {
+    const { fetchJson } = await import('@/utils/fetchutils');
+    let finish;
+    fetchJson.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const controller = new AbortController();
+    const commit = vi.fn();
+    const pending = slplayerActions.SEND_PLEX_DECISION_REQUEST(
+      { getters: {}, commit, dispatch: vi.fn() },
+      { signal: controller.signal },
+    );
+    controller.abort();
+    finish({ MediaContainer: {} });
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    expect(commit).not.toHaveBeenCalled();
+  });
+
+  it('does not retry transcoding after cancellation during source load', async () => {
+    const controller = new AbortController();
+    const commit = vi.fn();
+    let started = false;
+    const dispatch = vi.fn((type) => {
+      if (type === 'LOAD_PLAYER_SRC') {
+        started = true;
+        return new Promise(() => {});
+      }
+      return Promise.resolve();
+    });
+    const pending = slplayerActions.CHANGE_PLAYER_SRC({ getters: {}, commit, dispatch }, { signal: controller.signal });
+    await vi.waitFor(() => expect(started).toBe(true));
+    const rejected = expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    controller.abort();
+    await rejected;
+    const { unload } = await import('@/player');
+    expect(unload).toHaveBeenCalled();
+    expect(commit).not.toHaveBeenCalledWith('SET_FORCE_TRANSCODE_RETRY', true);
+    expect(commit).toHaveBeenCalledWith('SET_IS_CHANGING_SOURCE', false);
+  });
+
+  it('shares player initialization between overlapping callers', () => {
+    const getters = {};
+    const commit = vi.fn((type, value) => {
+      if (type === 'SET_PLAYER_INITIALIZED_DEFERRED_PROMISE') getters.GET_PLAYER_INITIALIZED_DEFERRED_PROMISE = value;
+    });
+    const first = slplayerActions.NAVIGATE_AND_INITIALIZE_PLAYER({ getters, commit });
+    const second = slplayerActions.NAVIGATE_AND_INITIALIZE_PLAYER({ getters, commit });
+    expect(first).toBe(second);
+    expect(commit.mock.calls.filter(([type]) => type === 'SET_NAVIGATE_TO_PLAYER')).toHaveLength(1);
+  });
+});
+
+describe('buffering source changes', () => {
+  it('does not carry a previous source’s buffering timer into the new source', async () => {
+    const context = {
+      state: { bufferingHistory: [] },
+      getters: { GET_PLAYER_STATE: 'playing', GET_SRC_URL: 'fixture', GET_OFFSET_MS: 0 },
+      rootGetters: {},
+      commit: vi.fn(),
+      dispatch: vi.fn(),
+    };
+    await slplayerActions.HANDLE_PLAYER_BUFFERING(context, { buffering: true });
+    await slplayerActions.LOAD_PLAYER_SRC(context);
+    context.dispatch.mockClear();
+    context.commit.mockClear();
+    await slplayerActions.HANDLE_PLAYER_BUFFERING(context, { buffering: false });
+    expect(context.commit).not.toHaveBeenCalledWith('RECORD_BUFFERING_EPISODE', expect.anything());
+    expect(context.dispatch).not.toHaveBeenCalledWith(
+      'REPORT_PLAYBACK_DIAGNOSTIC',
+      expect.objectContaining({ event: 'buffering-end' }),
+    );
   });
 });

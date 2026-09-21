@@ -1,13 +1,12 @@
+import { buildPlaybackDiagnostics } from '@/utils/playbackdiagnostics';
+import { hasPendingUserSeek, recordSeekIntent } from './seekIntent';
 import {
-  getPlayer, getRawPlayer, setPlayer, getOverlay, setOverlay, isCasting,
+  getPlayer, getRawPlayer, setPlayer, getOverlay, setOverlay, isCasting, setControlsCleanup,
 } from './state';
 
 let cachedDuration = 0;
 
-// eslint-disable-next-line no-underscore-dangle
-export const areControlsShown = () => !getOverlay() || (getOverlay()?.getControls().enabled_
-    && (getOverlay()?.getControls().getControlsContainer().getAttribute('shown') != null
-      || getOverlay()?.getControls().getControlsContainer().getAttribute('casting') != null));
+export const areControlsShown = () => !getOverlay() || getOverlay().getControls().isOpaque();
 
 export const getControlsOffset = (fallbackHeight) => (getRawPlayer()?.getMediaElement()?.offsetHeight
   || fallbackHeight) * 0.025 + 48 || 0;
@@ -113,9 +112,15 @@ export const waitForMediaElementEvent = ({ signal, type }) => new Promise((resol
 
 export const cancelTrickPlay = () => getPlayer().cancelTrickPlay();
 
-export const load = (...args) => getPlayer().load(...args);
+export const load = (...args) => {
+  cachedDuration = 0;
+  return getPlayer().load(...args);
+};
 
-export const unload = (...args) => getPlayer().unload(...args);
+export const unload = (...args) => {
+  cachedDuration = 0;
+  return getPlayer().unload(...args);
+};
 
 export const getPlaybackRate = () => getPlayer().getPlaybackRate();
 
@@ -123,8 +128,19 @@ export const setPlaybackRate = (rate) => {
   getPlayer().getMediaElement().playbackRate = rate;
 };
 
-export const setCurrentTimeMs = (timeMs) => {
-  getPlayer().getMediaElement().currentTime = timeMs / 1000;
+export const setCurrentTimeMs = (timeMs, { userInitiated = false } = {}) => {
+  // Let a deliberate request settle before the next periodic correction.
+  if (!userInitiated && hasPendingUserSeek()) return;
+  const video = getPlayer().getMediaElement();
+  const target = timeMs / 1000;
+  if (video.currentTime === target) return;
+  recordSeekIntent(userInitiated);
+  try {
+    video.currentTime = target;
+  } catch (error) {
+    recordSeekIntent();
+    throw error;
+  }
 };
 
 export const getSmallPlayButton = () => getOverlay()
@@ -156,6 +172,15 @@ export const insertElementBeforeVideo = (element) => {
 
 export const getMediaElement = () => getRawPlayer()?.getMediaElement?.() || null;
 
+export const getPlaybackDiagnostics = () => ({
+  ...buildPlaybackDiagnostics({
+    mediaElement: getPlayer()?.getMediaElement?.() || null,
+    stats: getPlayer()?.getStats?.(),
+  }),
+  isCasting: isCasting(),
+  buffering: isBuffering() ?? null,
+});
+
 export { isCasting };
 
 export const addCastStatusListener = (callback) => {
@@ -176,8 +201,12 @@ export const removeCastStatusListener = (callback) => {
 };
 
 export const destroy = async () => {
+  setControlsCleanup(null);
   const savedOverlay = getOverlay();
   setPlayer(null);
   setOverlay(null);
-  await savedOverlay.destroy();
+  cachedDuration = 0;
+  if (savedOverlay) {
+    await savedOverlay.destroy();
+  }
 };

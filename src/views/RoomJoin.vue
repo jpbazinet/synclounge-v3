@@ -1,22 +1,32 @@
 <template>
-  <v-container class="fill-height">
+  <v-container class="welcome-layout">
     <v-row
       align="center"
       justify="center"
     >
       <v-col>
         <v-card
-          class="mx-auto"
-          max-width="550"
+          class="mx-auto welcome-card"
+          max-width="480"
           :loading="loading"
-          variant="outlined"
-          color="rgba(255, 255, 255, 0.12)"
+          variant="flat"
         >
-          <v-card-title>
-            <v-img
+          <div class="welcome-heading">
+            <img
               src="@/assets/images/logos/logo-long-light.png"
-            />
-          </v-card-title>
+              alt="SyncLounge"
+              class="welcome-logo"
+            >
+            <p class="eyebrow">
+              YOU’RE INVITED
+            </p>
+            <h1 class="welcome-title">
+              Your watch party awaits.
+            </h1>
+            <p class="welcome-description">
+              We’re connecting you to your friends. You’ll join their room in a moment.
+            </p>
+          </div>
 
           <v-alert
             v-if="error"
@@ -27,7 +37,8 @@
 
           <v-card-text
             v-if="loading"
-            class="text-center"
+            class="text-center pb-6"
+            role="status"
           >
             <v-progress-circular
               indeterminate
@@ -39,12 +50,12 @@
 
           <v-card-actions
             v-if="error"
-            class="mt-2 justify-center"
+            class="welcome-actions justify-center"
           >
             <v-btn
               variant="flat"
               color="primary"
-              class="text-white"
+              class="welcome-primary"
               block
               :disabled="loading"
               @click="joinInvite"
@@ -117,8 +128,7 @@ export default {
       this.loading = true;
 
       const startedOnRoomJoin = this.$route.name === 'RoomJoin';
-      const redirect = this.$route.query.redirect;
-      const watching = this.$route.query.watching;
+      const { redirect, watching } = this.$route.query;
       const safeRedirect = this.getSafeRoomRedirect(redirect);
       const syncOnJoin = !safeRedirect || this.$router.resolve(safeRedirect).name === 'WebPlayer';
 
@@ -140,12 +150,14 @@ export default {
           this.$router.push(this.linkWithRoom(destination));
         }
       } catch (e) {
-        this.DISCONNECT_IF_CONNECTED();
-        console.error(e);
-        this.error = mapErrorMessage(e);
+        if (e.name !== 'AbortError') {
+          await this.DISCONNECT_IF_CONNECTED();
+          console.error(e);
+          this.error = mapErrorMessage(e);
+        }
+      } finally {
+        this.loading = false;
       }
-
-      this.loading = false;
     },
   },
 };

@@ -1,4 +1,4 @@
-![SyncLounge](https://github.com/synclounge/synclounge/raw/master/src/assets/images/logos/logo-long-dark.png)
+![SyncLounge](src/assets/images/logos/logo-long-dark.png)
 
 ## jpbazinet Customizations
 
@@ -12,6 +12,10 @@ This fork includes the following additions on top of the base [synclounge](https
 ---
 
 # SyncLounge
+
+[![CI](https://github.com/chrisae9/synclounge/actions/workflows/ci.yml/badge.svg)](https://github.com/chrisae9/synclounge/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/chrisae9/synclounge/actions/workflows/codeql.yml/badge.svg)](https://github.com/chrisae9/synclounge/actions/workflows/codeql.yml)
+[![Latest release](https://img.shields.io/github/v/release/chrisae9/synclounge)](https://github.com/chrisae9/synclounge/releases/latest)
 
 SyncLounge is a tool to sync [Plex](https://plex.tv) content across multiple players in multiple locations. Watch movies and TV shows together with friends and family, no matter where they are.
 
@@ -44,9 +48,22 @@ SyncLounge keeps multiple viewing sessions in sync using a WebSocket server as a
 - Library browsing with sorting, filtering, and A-Z quick navigation
 - Search across all connected Plex servers
 - Chat with room members
-- Password-protected rooms
+- Optional Plex user and server authorization allowlists
 - Shareable invite links with rich social previews
+- Installable desktop and mobile web app with an offline connection screen
 - Configurable sync flexibility and sync method (clean seek / skip ahead)
+
+## Watch-party controls and troubleshooting
+
+New rooms open on library browsing. On phones, library navigation shows a back action and the current location. Media rows support touch scrolling; desktop users can also use the arrows. Invite copies the room link. Settings → Advanced contains the optional watch-party service selector, separate from Plex library selection.
+
+The watch-party drawer starts in Basic mode. Advanced controls reveal synchronization settings and participant diagnostics; the message composer stays available in landscape and while typing.
+
+The host can choose Strict (0.5 seconds), Balanced (3 seconds), or Relaxed (7 seconds) room synchronization, or use each viewer’s personal tolerance. Relaxed synchronization reduces corrective seeks; it cannot repair a slow stream. Participant details show playback state, drift, and recent buffer/quality measurements. After repeated substantial buffering, Settings can offer a lower-quality option for that viewer; applying it may require Plex transcoding.
+
+Settings → Notifications can hide buffering popups without disabling playback diagnostics. Menu → Report a problem copies a bounded report for sharing with the host, without requiring GitHub. Include what happened and the report’s timestamp; Plex/transcode session identifiers connect it to server logs. Raw error messages, credentials, and chat are excluded. GitHub issue creation is optional and requires pasting the report into the issue.
+
+Picture-in-picture remains available when the browser supports it. Installed iOS web apps may have platform limitations; SyncLounge does not force picture-in-picture when leaving the app.
 
 ## Running
 
@@ -67,15 +84,28 @@ services:
     restart: unless-stopped
 ```
 
+Development builds are published separately as `ghcr.io/chrisae9/synclounge:dev`. Every development build also has an immutable `dev-<commit SHA>` tag. These images may be unstable and never replace `latest`.
+
 ### Node.js
 
 ```sh
-npm install
+SKIP_BUILD=true npm ci
 npm run build
 node server.js
 ```
 
-Listens on port 8088 by default. All paths are relative, so you can use a reverse proxy at any subdirectory or subdomain without additional SyncLounge configuration.
+Listens on port 8088 by default. The documented deployment serves SyncLounge at the root of a hostname; path-prefix deployments require additional asset-base configuration and are not currently supported by the published image.
+
+## Install as an app
+
+Serve SyncLounge over HTTPS (or localhost for testing), then choose **Install SyncLounge**
+in the navigation menu. On iPhone and iPad, use the browser’s **Share → Add to Home Screen**
+option. Installation uses the root of the hostname, matching the supported deployment layout.
+
+Watching and chatting require a connection. The offline screen caches only public assets;
+room pages, credentials, posters, and video are never cached by the service worker.
+When an update is ready, choose **Update available → Reload now** between viewing sessions.
+Updates do not automatically reload an active player.
 
 ## Configuration
 
@@ -86,7 +116,56 @@ AUTHENTICATION='{"mechanism":"plex","type":["server"],"authorized":["MACHINE_ID"
 SERVERS='[{"name":"My Server","location":"Mothership","url":"https://myserver.com"}]'
 ```
 
+`AUTHENTICATION` is enforced on socket connections using the signed-in user's Plex
+account or accessible server IDs. Invalid restrictions fail startup; rejected or unavailable
+Plex verification denies the connection. Restricted deployments must serve the web app and
+socket endpoint from the same origin: the browser sends its Plex credential only to its
+own origin. Unrestricted deployments keep `mechanism: "none"`.
+
+Host recovery uses a server-issued reconnect proof stored per browser tab. Reloading that
+tab preserves its identity; clearing session storage starts a new identity. Temporary
+connection loss, including a heartbeat timeout, automatically reconnects the tab and
+rejoins its room. Leaving a room cancels pending recovery.
+
+Rooms clear when their last participant leaves; playback is not saved for an empty
+room. Reopening an old movie invite without active playback returns to the library
+with an explanation so you can choose a movie again.
+
+Set the server option `ROOM_STATE_PATH=/data/private/room-state.json` on a persistent volume to
+preserve reconnect proofs and room ownership across server restarts. The process must be
+able to create or own that private directory; it must not be group- or world-writable. The file contains private signing material; do not serve it
+as static content or share it between concurrently running servers. Without this option,
+restarting the server resets reconnect identities and room ownership.
+
+After a restart, a remembered host has 60 seconds to rejoin with its existing tab proof;
+a host that was playing must restore media before reclaiming control. Explicit host
+transfers override recovery. Inactive ownership records expire after 24 hours. Enabling
+persistence for the first time cannot recover proofs from an earlier server instance.
+
+Only documented browser configuration is returned from `/config.json`; arbitrary keys in a
+configuration file remain server-side. `TRUST_PROXY` controls which reverse proxies may supply
+client addresses. It defaults to `loopback`, matching the Nginx example below. For a proxy on a
+private container network, prefer an explicit hop count or the proxy's exact CIDR. A named range
+such as `uniquelocal` is safe only when the application is directly reachable by that reverse
+proxy; other clients on the trusted network could otherwise spoof `X-Forwarded-For` and bypass
+per-IP limits. Do not use `TRUST_PROXY=true`. Set `PUBLIC_ORIGIN` to the externally reachable
+HTTP(S) origin (for example, `https://synclounge.example.com`) to enable absolute poster URLs in
+Open Graph previews. Incoming `Host` headers are never used to construct those URLs.
+
+Shared previews come from the current room host's validated socket updates. Browse links
+show media details only when they match that room's current media; other links use the
+generic preview. The legacy `/api/metadata` writer and `/share/poster` relay return HTTP 410.
+Poster snapshots use unguessable revision URLs and remain available for up to six hours
+after a media change so link-preview caches can finish fetching them.
+
 ## Reverse Proxy (Nginx)
+
+Socket admission defaults to 512 clients overall, 32 clients per IP, 32 pending Plex
+authentication requests, and 60 connection attempts per IP per minute. Override with
+`SOCKET_MAX_CONNECTIONS`, `SOCKET_MAX_PER_IP`, `SOCKET_MAX_PENDING_AUTH`, and
+`SOCKET_ATTEMPTS_PER_MINUTE` (positive integers). Transport-only TCP clients are capped
+at twice `SOCKET_MAX_CONNECTIONS`. Set `TRUST_PROXY` correctly so a reverse proxy does
+not make all users share one IP allowance. Limits apply separately to each server process.
 
 ```nginx
 map $http_upgrade $connection_upgrade {
@@ -118,11 +197,13 @@ server {
 ## Development
 
 ```sh
-npm install
+SKIP_BUILD=true npm ci
 npm run serve   # Vite dev server with HMR
 npm run build   # Production build to dist/
 npm test        # Run tests
 ```
+
+Pull requests target `dev`; `main` is reserved for stable release promotions. See [CONTRIBUTING.md](CONTRIBUTING.md) for the complete verification and review contract.
 
 ## Chromecast
 
@@ -136,6 +217,6 @@ Continued by [chrisae9](https://github.com/chrisae9).
 
 ## License
 
-MIT License. See [LICENSE.txt](LICENSE.txt).
+MIT License. See [LICENSE](LICENSE).
 
 SyncLounge is in no way affiliated with Plex Inc.

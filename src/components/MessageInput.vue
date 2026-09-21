@@ -1,77 +1,88 @@
 <template>
-  <div class="message-input-wrapper">
-    <v-menu
-      v-model="emojiPickerOpen"
-      :close-on-content-click="false"
-      top
-      offset-y
-      nudge-top="8"
-      max-width="360"
-    >
-      <template #activator="{ props }">
-        <v-btn
-          icon
-          variant="text"
-          density="compact"
-          class="emoji-btn ml-1"
-          v-bind="props"
-          title="Emoji"
-        >
-          <span class="emoji-trigger">&#x1F642;</span>
-        </v-btn>
-      </template>
-      <v-card class="emoji-picker pa-2">
-        <div class="emoji-search mb-1">
-          <v-text-field
-            v-model="emojiSearch"
-            dense
-            hide-details
-            placeholder="Search emoji..."
-            prepend-inner-icon="mdi-magnify"
-            outlined
-            @click.stop
-          />
-        </div>
-        <div class="emoji-grid">
-          <button
-            v-for="e in filteredEmojis"
-            :key="e.emoji"
-            type="button"
-            class="emoji-item"
-            :title="e.name"
-            @click.stop="insertEmoji(e.emoji)"
+  <form
+    class="chat-composer"
+    aria-label="Room chat"
+    @submit.prevent="sendMessage"
+  >
+    <div class="message-input-wrapper">
+      <v-menu
+        v-model="emojiPickerOpen"
+        :close-on-content-click="false"
+        top
+        offset-y
+        nudge-top="8"
+        max-width="360"
+      >
+        <template #activator="{ props }">
+          <v-btn
+            icon
+            variant="text"
+            density="compact"
+            class="emoji-btn ml-1"
+            v-bind="props"
+            title="Emoji"
           >
-            {{ e.emoji }}
-          </button>
-        </div>
-      </v-card>
-    </v-menu>
-    <v-text-field
-      ref="messageInput"
-      v-model="messageToBeSent"
-      label="Message"
-      hide-details
-      single-line
-      density="compact"
-      variant="outlined"
-      rounded
-      color="#e5a00d"
-      class="ml-1 flex-input"
-      @keyup.enter="sendMessage"
-      @keyup.space="convertEmoticons"
-      @paste="handlePaste"
-    />
-    <v-btn
-      icon
-      variant="text"
-      density="compact"
-      class="send-btn mx-1"
-      title="Send"
-      @click="sendMessage"
-    >
-      <v-icon size="20">send</v-icon>
-    </v-btn>
-  </div>
+            <span class="emoji-trigger">&#x1F642;</span>
+          </v-btn>
+        </template>
+        <v-card class="emoji-picker pa-2">
+          <div class="emoji-search mb-1">
+            <v-text-field
+              v-model="emojiSearch"
+              dense
+              hide-details
+              placeholder="Search emoji..."
+              prepend-inner-icon="mdi-magnify"
+              outlined
+              @click.stop
+            />
+          </div>
+          <div class="emoji-grid">
+            <button
+              v-for="e in filteredEmojis"
+              :key="e.emoji"
+              type="button"
+              class="emoji-item"
+              :title="e.name"
+              @click.stop="insertEmoji(e.emoji)"
+            >
+              {{ e.emoji }}
+            </button>
+          </div>
+        </v-card>
+      </v-menu>
+      <v-text-field
+        ref="messageInput"
+        v-model="messageToBeSent"
+        label="Message"
+        hide-details
+        single-line
+        density="compact"
+        variant="outlined"
+        rounded
+        maxlength="500"
+        autocomplete="off"
+        color="#e5a00d"
+        class="ml-1 flex-input"
+        @keydown.enter="handleEnter"
+        @keyup.space="convertEmoticons"
+        @paste="handlePaste"
+      />
+      <v-btn
+        icon
+        variant="text"
+        density="compact"
+        class="send-btn mx-1"
+        type="submit"
+        aria-label="Send message"
+        :disabled="!messageToBeSent.trim() || sending"
+        :loading="sending"
+        @click.prevent="sendMessage"
+      >
+        <v-icon size="20">send</v-icon>
+      </v-btn>
+    </div>
+  </form>
 </template>
 
 <script>
@@ -101,11 +112,11 @@ const EMOJIS = [
   { emoji: '\u{1F44F}', name: 'clap' },
   { emoji: '\u{1F64C}', name: 'raised hands' },
   { emoji: '\u{1F91D}', name: 'handshake' },
-  { emoji: '\u262E\uFE0F', name: 'peace' },
+  { emoji: '☮️', name: 'peace' },
   { emoji: '\u{1F91E}', name: 'fingers crossed' },
   { emoji: '\u{1F4AA}', name: 'muscle' },
   { emoji: '\u{1FAF6}', name: 'heart hands' },
-  { emoji: '\u2764\uFE0F', name: 'heart' },
+  { emoji: '❤️', name: 'heart' },
   { emoji: '\u{1F525}', name: 'fire' },
   { emoji: '\u{1F480}', name: 'skull' },
   { emoji: '\u{1F4A9}', name: 'poop' },
@@ -113,14 +124,14 @@ const EMOJIS = [
   { emoji: '\u{1F389}', name: 'party' },
   { emoji: '\u{1F37F}', name: 'popcorn' },
   { emoji: '\u{1F3AC}', name: 'clapper' },
-  { emoji: '\u{1F4FD}\uFE0F', name: 'film projector' },
+  { emoji: '\u{1F4FD}️', name: 'film projector' },
   { emoji: '\u{1F355}', name: 'pizza' },
   { emoji: '\u{1F37A}', name: 'beer' },
-  { emoji: '\u2615', name: 'coffee' },
+  { emoji: '☕', name: 'coffee' },
   { emoji: '\u{1F926}', name: 'facepalm' },
   { emoji: '\u{1F937}', name: 'shrug' },
   { emoji: '\u{1F4AF}', name: '100' },
-  { emoji: '\u2728', name: 'sparkles' },
+  { emoji: '✨', name: 'sparkles' },
   { emoji: '\u{1F606}', name: 'laughing' },
   { emoji: '\u{1F605}', name: 'sweat smile' },
   { emoji: '\u{1FAE0}', name: 'melting' },
@@ -147,7 +158,7 @@ const EMOTICONS = [
   [':O', '\u{1F62E}'],
   [':*', '\u{1F618}'],
   ['B)', '\u{1F60E}'],
-  ['<3', '\u2764\uFE0F'],
+  ['<3', '❤️'],
   ['XD', '\u{1F602}'],
   ['xD', '\u{1F602}'],
   ['^_^', '\u{1F601}'],
@@ -190,6 +201,7 @@ export default {
     messageToBeSent: '',
     emojiPickerOpen: false,
     emojiSearch: '',
+    sending: false,
   }),
   computed: {
     filteredEmojis() {
@@ -202,12 +214,27 @@ export default {
     ...mapActions('synclounge', [
       'SEND_MESSAGE',
     ]),
-    sendMessage() {
-      const text = replaceEmoticons(this.messageToBeSent).trim();
-      if (text === '') return;
-      this.SEND_MESSAGE(text);
-      this.messageToBeSent = '';
+
+    handleEnter(event) {
+      // Some IMEs finish composition before their final keydown event.
+      if (event.isComposing || event.keyCode === 229) return;
+      event.preventDefault();
+      this.sendMessage();
     },
+
+    async sendMessage() {
+      const text = replaceEmoticons(this.messageToBeSent).trim();
+      if (!text || this.sending) return;
+      this.sending = true;
+      const submittedMessage = this.messageToBeSent;
+      try {
+        await this.SEND_MESSAGE(text);
+        if (this.messageToBeSent === submittedMessage) this.messageToBeSent = '';
+      } finally {
+        this.sending = false;
+      }
+    },
+
     convertEmoticons() {
       const converted = replaceEmoticons(this.messageToBeSent);
       if (converted !== this.messageToBeSent) {
@@ -219,6 +246,7 @@ export default {
         });
       }
     },
+
     handlePaste(event) {
       const items = Array.from((event.clipboardData && event.clipboardData.items) || []);
       const imageItem = items.find((item) => item.type.startsWith('image/'));
@@ -250,6 +278,7 @@ export default {
       };
       reader.readAsDataURL(file);
     },
+
     insertEmoji(emoji) {
       const input = this.$refs.messageInput.$el.querySelector('input');
       if (!input) {
@@ -272,14 +301,21 @@ export default {
 </script>
 
 <style scoped>
+.chat-composer {
+  padding: 12px;
+  padding-bottom: max(12px, env(safe-area-inset-bottom));
+  border-top: 1px solid var(--sl-border);
+  background: rgba(16, 18, 22, 0.94);
+}
+
 .message-input-wrapper {
   display: flex;
   align-items: center;
   width: 100%;
   min-width: 0;
   overflow: hidden;
-  margin-bottom: 4px;
 }
+
 .emoji-btn {
   flex-shrink: 0;
   align-self: center;

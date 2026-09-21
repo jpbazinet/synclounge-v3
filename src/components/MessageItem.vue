@@ -5,8 +5,11 @@
         <v-img :src="sender.thumb" />
       </v-avatar>
     </template>
-    <v-list-item-title class="message-username">
-      {{ sender.username }}
+    <v-list-item-title>
+      <div class="message-heading">
+        <span class="message-username">{{ sender.username }}</span>
+        <span class="message-time">{{ formattedTime }}</span>
+      </div>
     </v-list-item-title>
     <v-list-item-subtitle>
       <!-- eslint-disable-next-line vue/no-v-html -->
@@ -84,20 +87,25 @@ export default {
   padding-inline-end: 0px !important;
   align-self: flex-start !important;
 }
+.message-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+}
 .message-username {
   color: #f0a020 !important;
   font-weight: 700 !important;
   font-size: 12px !important;
   letter-spacing: 0.01em !important;
-  margin-bottom: 2px !important;
-  white-space: normal !important;
-  overflow: visible !important;
-  text-overflow: unset !important;
+  overflow-wrap: anywhere;
 }
 .message-time {
   color: rgb(255 255 255 / 40%);
   font-weight: 400;
   font-size: 11px;
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 .message-content {
   font-size: 14px !important;

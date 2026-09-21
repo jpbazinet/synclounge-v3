@@ -4,6 +4,26 @@ export const shouldApplyAutojoin = (to, config) => Boolean(
   && to.fullPath === '/',
 );
 
+export const getEmptyPlayerRedirect = (to, activeMedia) => (
+  to.name === 'WebPlayer' && !activeMedia
+    ? {
+      name: 'PlexHome',
+      params: to.params,
+      query: { playback: 'unavailable' },
+      replace: true,
+    }
+    : null
+);
+
+export const getSignInRoute = (route) => ({
+  name: 'SignIn',
+  ...(route?.matched?.some((record) => record.meta.requiresAuth) && {
+    query: {
+      redirect: route.fullPath,
+    },
+  }),
+});
+
 const isEqualIfExpectedTrue = (expected, got) => (expected
   ? expected === got
   : !got);

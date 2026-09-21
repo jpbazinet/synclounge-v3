@@ -36,7 +36,9 @@
             class="unmute-banner text-white"
             @click.stop="handleAutoplayUnblock"
           >
-            <v-icon start>mdi-volume-off</v-icon>
+            <v-icon start>
+              mdi-volume-off
+            </v-icon>
             Click to unmute
           </v-btn>
         </v-fade-transition>
@@ -62,29 +64,36 @@
         no-gutters
         class="pa-3 d-none d-sm-flex hoverBar"
       >
-          <v-col>
-            <v-container fluid>
-              <v-row no-gutters>
-                <v-col cols="auto">
-                  <img
-                    :src="GET_THUMB_URL"
-                    class="plex-thumb"
-                  >
-                </v-col>
+        <v-col>
+          <v-container fluid>
+            <v-row no-gutters>
+              <v-col cols="auto">
+                <img
+                  :src="GET_THUMB_URL"
+                  class="plex-thumb"
+                >
+              </v-col>
 
-                <v-col class="pl-3" style="min-width: 0;">
-                  <div>
-                    <div class="text-h5 text-truncate">{{ GET_TITLE }}</div>
-                    <div class="text-subtitle-1 text-medium-emphasis text-truncate">{{ GET_SECONDARY_TITLE }}</div>
-                    <div class="text-subtitle-2 text-primary">
-                      Playing from {{ GET_PLEX_SERVER?.name }}
-                    </div>
+              <v-col
+                class="pl-3"
+                style="min-width: 0;"
+              >
+                <div>
+                  <div class="text-h5 text-truncate">
+                    {{ GET_TITLE }}
                   </div>
-                </v-col>
-              </v-row>
-            </v-container>
-          </v-col>
-        </v-row>
+                  <div class="text-subtitle-1 text-medium-emphasis text-truncate">
+                    {{ GET_SECONDARY_TITLE }}
+                  </div>
+                  <div class="text-subtitle-2 text-primary">
+                    Playing from {{ GET_PLEX_SERVER?.name }}
+                  </div>
+                </div>
+              </v-col>
+            </v-row>
+          </v-container>
+        </v-col>
+      </v-row>
 
       <div
         v-if="$vuetify.display.xs"
@@ -105,10 +114,17 @@
             >
           </v-col>
 
-          <v-col class="pl-2" style="min-width: 0;">
+          <v-col
+            class="pl-2"
+            style="min-width: 0;"
+          >
             <div>
-              <div class="text-h6 text-truncate">{{ GET_TITLE }}</div>
-              <div class="text-subtitle-2 text-medium-emphasis text-truncate">{{ GET_SECONDARY_TITLE }}</div>
+              <div class="text-h6 text-truncate">
+                {{ GET_TITLE }}
+              </div>
+              <div class="text-subtitle-2 text-medium-emphasis text-truncate">
+                {{ GET_SECONDARY_TITLE }}
+              </div>
               <div class="text-subtitle-2 text-primary">
                 Playing from {{ GET_PLEX_SERVER?.name }}
               </div>
@@ -437,12 +453,12 @@ export default {
 
         case 'ArrowLeft':
           event.preventDefault();
-          setCurrentTimeMs(Math.max(0, getCurrentTimeMs() - 10000));
+          setCurrentTimeMs(Math.max(0, getCurrentTimeMs() - 10000), { userInitiated: true });
           break;
 
         case 'ArrowRight':
           event.preventDefault();
-          setCurrentTimeMs(getCurrentTimeMs() + 10000);
+          setCurrentTimeMs(getCurrentTimeMs() + 10000, { userInitiated: true });
           break;
 
         case 'ArrowUp':
@@ -466,7 +482,7 @@ export default {
 
     async checkAutoSkipIntro() {
       if (this.isInIntro && this.GET_AUTO_SKIP_INTRO) {
-        await this.SKIP_INTRO();
+        await this.SKIP_INTRO({ userInitiated: false });
       }
     },
   },
@@ -572,11 +588,15 @@ export default {
 }
 
 .shaka-play-button {
+  padding: clamp(22px, 3vw, 50px) !important;
+}
+
+:fullscreen .shaka-play-button {
   padding: 50px !important;
 }
 
 .shaka-spinner {
-  padding: 57px !important;
+  padding: clamp(16px, 4vw, 57px) !important;
 }
 
 .libjass-wrapper {

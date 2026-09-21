@@ -1,9 +1,22 @@
+import { CAF } from 'caf';
+import { abortable, throwIfAborted } from '@/utils/cancellation';
+
+let playbackGeneration = 0;
+
 export default {
+  CANCEL_PLAY_MEDIA: () => { playbackGeneration += 1; },
   PLAY_MEDIA: async ({
     commit, dispatch, rootGetters,
   }, {
-    mediaIndex, offset, metadata, machineIdentifier, userInitiated, shouldPlay = userInitiated,
+    signal, mediaIndex, offset, metadata, machineIdentifier, userInitiated, shouldPlay = userInitiated,
   }) => {
+    playbackGeneration += 1;
+    const generation = playbackGeneration;
+    const ensureCurrent = () => {
+      throwIfAborted(signal);
+      if (generation !== playbackGeneration) throw new DOMException('Playback replaced', 'AbortError');
+    };
+    ensureCurrent();
     console.debug('PLAY_MEDIA:', {
       title: metadata.title,
       ratingKey: metadata.ratingKey,
@@ -12,41 +25,13 @@ export default {
       offset,
     });
 
-    // Fire-and-forget: update room metadata for Discord embeds
-    try {
-      const room = rootGetters['synclounge/GET_ROOM'];
-      const posterUrl = rootGetters['plexservers/GET_MEDIA_IMAGE_URL']({
-        machineIdentifier,
-        mediaUrl: metadata.thumb,
-        width: 600,
-        height: 900,
-      });
-
-      fetch('/api/metadata', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          title: metadata.title,
-          year: metadata.year,
-          summary: metadata.summary,
-          type: metadata.type,
-          posterUrl,
-          machineIdentifier,
-          ratingKey: metadata.ratingKey,
-          grandparentTitle: metadata.grandparentTitle,
-          parentIndex: metadata.parentIndex,
-          index: metadata.index,
-          room,
-        }),
-      }).catch(() => {});
-    } catch {
-      // Best-effort
-    }
-
-    commit('SET_ACTIVE_PLAY_QUEUE', await dispatch('plexservers/CREATE_PLAY_QUEUE', {
+    const queue = await abortable(dispatch('plexservers/CREATE_PLAY_QUEUE', {
+      signal,
       machineIdentifier,
       ratingKey: metadata.ratingKey,
-    }, { root: true }));
+    }, { root: true }), signal);
+    ensureCurrent();
+    commit('SET_ACTIVE_PLAY_QUEUE', queue);
 
     commit('SET_ACTIVE_PLAY_QUEUE_MACHINE_IDENTIFIER', machineIdentifier);
     commit('SET_ACTIVE_MEDIA_METADATA', metadata);
@@ -57,19 +42,22 @@ export default {
     commit('slplayer/SET_PLAYER_STATE', 'buffering', { root: true });
     commit('slplayer/SET_MASK_PLAYER_STATE', true, { root: true });
     await dispatch('synclounge/PROCESS_MEDIA_UPDATE', userInitiated, { root: true });
+    ensureCurrent();
     commit('slplayer/SET_SHOULD_PLAY_ON_LOAD', Boolean(shouldPlay), { root: true });
 
-    if (rootGetters['slplayer/IS_PLAYER_INITIALIZED']) {
-      await dispatch('slplayer/CHANGE_PLAYER_SRC', true, { root: true });
-      if (shouldPlay) {
-        await dispatch('slplayer/PRESS_PLAY', null, { root: true });
-      }
-      commit('slplayer/SET_SHOULD_PLAY_ON_LOAD', null, { root: true });
-      if (!rootGetters['slplayer/GET_PLEX_TIMELINE_UPDATER_CANCEL_TOKEN']) {
-        dispatch('slplayer/START_PERIODIC_PLEX_TIMELINE_UPDATE', null, { root: true });
-      }
-    } else {
-      await dispatch('slplayer/NAVIGATE_AND_INITIALIZE_PLAYER', null, { root: true });
+    if (!rootGetters['slplayer/IS_PLAYER_INITIALIZED']) {
+      await abortable(dispatch('slplayer/NAVIGATE_AND_INITIALIZE_PLAYER', null, { root: true }), signal);
+      ensureCurrent();
+    }
+    await abortable(dispatch('slplayer/CHANGE_PLAYER_SRC', { signal }, { root: true }), signal);
+    ensureCurrent();
+    if (shouldPlay) {
+      await dispatch('slplayer/PRESS_PLAY', null, { root: true });
+      ensureCurrent();
+    }
+    commit('slplayer/SET_SHOULD_PLAY_ON_LOAD', null, { root: true });
+    if (!rootGetters['slplayer/GET_PLEX_TIMELINE_UPDATER_CANCEL_TOKEN']) {
+      dispatch('slplayer/START_PERIODIC_PLEX_TIMELINE_UPDATE', null, { root: true });
     }
   },
 
@@ -80,11 +68,13 @@ export default {
   FETCH_JOIN_PLAYER_DATA: async ({ getters, dispatch }) => ({
     ...await dispatch('FETCH_TIMELINE_POLL_DATA'),
     media: getters.GET_ACTIVE_MEDIA_POLL_METADATA,
+    roomPreview: getters.GET_ACTIVE_MEDIA_ROOM_PREVIEW,
     playerProduct: getters.GET_CHOSEN_CLIENT?.product,
   }),
 
   SYNC: async ({ dispatch, rootGetters }, cancelSignal) => {
     const playerPollData = await dispatch('FETCH_TIMELINE_POLL_DATA_CACHE');
+    throwIfAborted(cancelSignal);
     const hostUser = rootGetters['synclounge/GET_HOST_USER'];
     if (!hostUser) {
       return undefined;
@@ -109,26 +99,20 @@ export default {
       return dispatch('SKIP_AHEAD', { cancelSignal, offset });
     }
 
-    const browserOs = rootGetters.GET_BROWSER?.os;
-    const canSoftSeek = browserOs !== 'iOS' && browserOs !== 'iPadOS';
-    const softSeekThreshold = rootGetters.GET_CONFIG.slplayer_soft_seek_threshold ?? 200;
-    if (canSoftSeek
-      && hostUser.state === 'playing'
-      && playerPollData.state === 'playing'
-      && absDifference > softSeekThreshold) {
-      try {
-        return await dispatch('slplayer/SOFT_SEEK', adjustedHostTime, { root: true });
-      } catch (e) {
-        console.debug('SYNC soft seek skipped:', e.message);
-      }
-    }
-
+    // Even buffered seeks can interrupt decoding. Honor the selected tolerance
+    // instead of repeatedly seeking to correct imperceptible drift.
     return 'No sync needed';
   },
 
-  PRESS_PLAY: ({ dispatch }) => dispatch('slplayer/PRESS_PLAY', null, { root: true }),
+  PRESS_PLAY: ({ dispatch }, signal) => {
+    throwIfAborted(signal);
+    return dispatch('slplayer/PRESS_PLAY', null, { root: true });
+  },
 
-  PRESS_PAUSE: ({ dispatch }) => dispatch('slplayer/PRESS_PAUSE', null, { root: true }),
+  PRESS_PAUSE: ({ dispatch }, signal) => {
+    throwIfAborted(signal);
+    return dispatch('slplayer/PRESS_PAUSE', null, { root: true });
+  },
 
   REFRESH_PLAYER_STATE: ({ dispatch }) => dispatch('slplayer/REFRESH_PLAYER_STATE', null, {
     root: true,
@@ -153,7 +137,6 @@ export default {
       return;
     }
 
-    const { CAF } = await import('caf');
     const startedAt = Date.now();
     const duration = rootGetters.GET_CONFIG.skip_ahead_time;
     await dispatch('SEEK_TO', {

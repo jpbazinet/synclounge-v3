@@ -1,11 +1,18 @@
 import { createApp } from 'vue';
+import { rememberDiagnostic } from './utils/problemreport';
 
 import vuetify from './plugins/vuetify';
 import App from './App.vue';
 import router from './router';
 import store from './store';
+import { startPwa } from './pwa';
 import mapErrorMessage from './utils/errorutils';
-import { shouldApplyAutojoin, shouldRedirectProtectedRoute } from './router/guardutils';
+import {
+  getSignInRoute,
+  getEmptyPlayerRedirect,
+  shouldApplyAutojoin,
+  shouldRedirectProtectedRoute,
+} from './router/guardutils';
 import { isConnected } from './socket';
 
 const vChatScroll = {
@@ -27,6 +34,22 @@ const vChatScroll = {
   },
 };
 
+const recordAppError = () => rememberDiagnostic({
+  event: 'application-error', clientTimestamp: new Date().toISOString(),
+});
+document.addEventListener('visibilitychange', () => rememberDiagnostic({
+  event: document.hidden ? 'app-backgrounded' : 'app-resumed',
+  clientTimestamp: new Date().toISOString(),
+}));
+window.addEventListener('online', () => rememberDiagnostic({
+  event: 'network-online', clientTimestamp: new Date().toISOString(),
+}));
+window.addEventListener('offline', () => rememberDiagnostic({
+  event: 'network-offline', clientTimestamp: new Date().toISOString(),
+}));
+window.addEventListener('error', recordAppError);
+window.addEventListener('unhandledrejection', recordAppError);
+
 const app = createApp(App);
 app.use(router).use(store).use(vuetify);
 app.directive('chat-scroll', vChatScroll);
@@ -38,6 +61,7 @@ app.config.errorHandler = (err) => {
     return;
   }
 
+  recordAppError();
   console.error(err);
 
   store.dispatch('DISPLAY_NOTIFICATION', {
@@ -62,12 +86,7 @@ router.beforeEach(async (to, from, next) => {
 
   if (store.getters['plex/IS_UNAUTHORIZED']
     && to.matched.some((record) => record.meta.requiresAuth)) {
-    next({
-      name: 'SignIn',
-      query: {
-        redirect: to.fullPath,
-      },
-    });
+    next(getSignInRoute(to));
   } else if (!store.getters['plex/GET_PLEX_AUTH_TOKEN']
     && to.matched.some((record) => record.meta.requiresPlexToken)) {
     next({ name: 'SignIn' });
@@ -95,8 +114,12 @@ router.beforeEach(async (to, from, next) => {
       next({ name: 'RoomCreation' });
     }
   } else {
-    next();
+    next(getEmptyPlayerRedirect(to, store.getters['plexclients/GET_ACTIVE_MEDIA_METADATA'])
+      || undefined);
   }
 });
+
+const stopPwa = startPwa({ register: import.meta.env.PROD });
+if (import.meta.hot) import.meta.hot.dispose(stopPwa);
 
 app.mount('#app');

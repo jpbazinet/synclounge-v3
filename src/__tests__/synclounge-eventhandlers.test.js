@@ -1,12 +1,14 @@
 import {
   describe, it, expect, vi, beforeEach, afterEach,
 } from 'vitest';
+import { getId, isConnected, waitForEvent } from '@/socket';
 import eventhandlers from '@/store/modules/synclounge/eventhandlers';
 
 vi.mock('@/socket', () => ({
   emit: vi.fn(),
   waitForEvent: vi.fn(),
   getId: vi.fn(),
+  isConnected: vi.fn(),
 }));
 
 function createMockContext(getterOverrides = {}) {
@@ -321,12 +323,16 @@ describe('HANDLE_USER_JOINED', () => {
     const ctx = createMockContext();
 
     await eventhandlers.HANDLE_USER_JOINED(ctx, {
-      id: 'u1', username: 'Alice', state: 'playing', media: { ratingKey: 'movie-1' },
+      id: 'u1',
+      reconnectIdentity: 'alice-session',
+      username: 'Alice',
+      state: 'playing',
+      media: { ratingKey: 'movie-1' },
     });
 
     expect(ctx.commit).toHaveBeenCalledWith('SET_USER', expect.objectContaining({
       id: 'u1',
-      data: expect.objectContaining({ username: 'Alice' }),
+      data: expect.objectContaining({ reconnectIdentity: 'alice-session', username: 'Alice' }),
     }));
     expect(ctx.dispatch).toHaveBeenCalledWith('ADD_MESSAGE_AND_CACHE_AND_NOTIFY', expect.objectContaining({
       senderId: 'u1',
@@ -338,7 +344,11 @@ describe('HANDLE_USER_JOINED', () => {
     const ctx = createMockContext({ IS_HOST_GRACE_PERIOD: false });
 
     await eventhandlers.HANDLE_USER_JOINED(ctx, {
-      id: 'u1', username: 'Alice', state: 'playing', media: { ratingKey: 'movie-1' },
+      id: 'u1',
+      reconnectIdentity: 'alice-session',
+      username: 'Alice',
+      state: 'playing',
+      media: { ratingKey: 'movie-1' },
     });
 
     expect(ctx.dispatch).not.toHaveBeenCalledWith('CLEAR_HOST_GRACE_PERIOD');
@@ -351,7 +361,11 @@ describe('HANDLE_USER_JOINED', () => {
     });
 
     await eventhandlers.HANDLE_USER_JOINED(ctx, {
-      id: 'u1', username: 'Alice', state: 'playing', media: { ratingKey: 'movie-1' },
+      id: 'u1',
+      reconnectIdentity: 'alice-session',
+      username: 'Alice',
+      state: 'playing',
+      media: { ratingKey: 'movie-1' },
     });
 
     expect(ctx.dispatch).not.toHaveBeenCalledWith('CLEAR_HOST_GRACE_PERIOD');
@@ -362,25 +376,31 @@ describe('HANDLE_USER_JOINED', () => {
       IS_HOST_GRACE_PERIOD: true,
       GET_PENDING_HOST_ID: 'me-1',
       GET_HOST_GRACE_PREVIOUS_HOST_USERNAME: 'Alice',
+      GET_HOST_GRACE_PREVIOUS_HOST_IDENTITY: 'alice-session',
     });
 
     await eventhandlers.HANDLE_USER_JOINED(ctx, {
-      id: 'u1', username: 'Alice', state: 'stopped', media: null,
+      id: 'u1', reconnectIdentity: 'alice-session', username: 'Alice', state: 'stopped', media: null,
     });
 
     expect(ctx.dispatch).not.toHaveBeenCalledWith('CLEAR_HOST_GRACE_PERIOD');
     expect(ctx.dispatch).not.toHaveBeenCalledWith('TRANSFER_HOST', 'u1');
   });
 
-  it('reclaims host when username matches during grace period and this client is pending host', async () => {
+  it('reclaims host when server identity matches during grace period and this client is pending host', async () => {
     const ctx = createMockContext({
       IS_HOST_GRACE_PERIOD: true,
       GET_PENDING_HOST_ID: 'me-1',
       GET_HOST_GRACE_PREVIOUS_HOST_USERNAME: 'Alice',
+      GET_HOST_GRACE_PREVIOUS_HOST_IDENTITY: 'alice-session',
     });
 
     await eventhandlers.HANDLE_USER_JOINED(ctx, {
-      id: 'u1', username: 'Alice', state: 'playing', media: { ratingKey: 'movie-1' },
+      id: 'u1',
+      reconnectIdentity: 'alice-session',
+      username: 'Alice',
+      state: 'playing',
+      media: { ratingKey: 'movie-1' },
     });
 
     expect(ctx.dispatch).toHaveBeenCalledWith('CLEAR_HOST_GRACE_PERIOD');
@@ -393,11 +413,16 @@ describe('HANDLE_USER_JOINED', () => {
       IS_HOST_GRACE_PERIOD: true,
       GET_PENDING_HOST_ID: 'other-pending-host',
       GET_HOST_GRACE_PREVIOUS_HOST_USERNAME: 'Alice',
+      GET_HOST_GRACE_PREVIOUS_HOST_IDENTITY: 'alice-session',
       AM_I_HOST: false,
     });
 
     await eventhandlers.HANDLE_USER_JOINED(ctx, {
-      id: 'u1', username: 'Alice', state: 'playing', media: { ratingKey: 'movie-1' },
+      id: 'u1',
+      reconnectIdentity: 'alice-session',
+      username: 'Alice',
+      state: 'playing',
+      media: { ratingKey: 'movie-1' },
     });
 
     expect(ctx.dispatch).not.toHaveBeenCalledWith('CLEAR_HOST_GRACE_PERIOD');
@@ -405,31 +430,38 @@ describe('HANDLE_USER_JOINED', () => {
     expect(ctx.dispatch).not.toHaveBeenCalledWith('TRANSFER_HOST', 'u1');
   });
 
-  it('reclaims host when username matches after server suffix change', async () => {
+  it('reclaims host by server identity after a username suffix change', async () => {
     const ctx = createMockContext({
       IS_HOST_GRACE_PERIOD: true,
       GET_PENDING_HOST_ID: 'me-1',
       GET_HOST_GRACE_PREVIOUS_HOST_USERNAME: 'Alice(2)',
+      GET_HOST_GRACE_PREVIOUS_HOST_IDENTITY: 'alice-session',
     });
 
     await eventhandlers.HANDLE_USER_JOINED(ctx, {
-      id: 'u1', username: 'Alice(1)', state: 'playing', media: { ratingKey: 'movie-1' },
+      id: 'u1',
+      reconnectIdentity: 'alice-session',
+      username: 'Alice(1)',
+      state: 'playing',
+      media: { ratingKey: 'movie-1' },
     });
 
     expect(ctx.dispatch).toHaveBeenCalledWith('CLEAR_HOST_GRACE_PERIOD');
     expect(ctx.commit).toHaveBeenCalledWith('SET_HOST_ID', 'u1');
   });
 
-  it('reclaims host by thumb even when username changed', async () => {
+  it('reclaims host by server identity even when username changed', async () => {
     const ctx = createMockContext({
       IS_HOST_GRACE_PERIOD: true,
       GET_PENDING_HOST_ID: 'me-1',
       GET_HOST_GRACE_PREVIOUS_HOST_USERNAME: 'OldName',
+      GET_HOST_GRACE_PREVIOUS_HOST_IDENTITY: 'alice-session',
       GET_HOST_GRACE_PREVIOUS_HOST_THUMB: 'https://plex.tv/avatar/abc',
     });
 
     await eventhandlers.HANDLE_USER_JOINED(ctx, {
       id: 'u1',
+      reconnectIdentity: 'alice-session',
       username: 'NewName',
       thumb: 'https://plex.tv/avatar/abc',
       state: 'playing',
@@ -445,11 +477,16 @@ describe('HANDLE_USER_JOINED', () => {
       IS_HOST_GRACE_PERIOD: true,
       GET_PENDING_HOST_ID: 'me-1',
       GET_HOST_GRACE_PREVIOUS_HOST_USERNAME: 'Alice',
+      GET_HOST_GRACE_PREVIOUS_HOST_IDENTITY: 'alice-session',
       AM_I_HOST: false,
     });
 
     await eventhandlers.HANDLE_USER_JOINED(ctx, {
-      id: 'u1', username: 'Alice', state: 'playing', media: { ratingKey: 'movie-1' },
+      id: 'u1',
+      reconnectIdentity: 'alice-session',
+      username: 'Alice',
+      state: 'playing',
+      media: { ratingKey: 'movie-1' },
     });
 
     expect(ctx.dispatch).toHaveBeenCalledWith('TRANSFER_HOST', 'u1');
@@ -471,6 +508,7 @@ describe('HANDLE_USER_JOINED', () => {
       IS_HOST_GRACE_PERIOD: true,
       GET_PENDING_HOST_ID: 'me-1',
       GET_HOST_GRACE_PREVIOUS_HOST_USERNAME: 'Alice',
+      GET_HOST_GRACE_PREVIOUS_HOST_IDENTITY: 'alice-session',
     });
     ctx.dispatch.mockImplementation((action) => {
       if (action === 'SYNC_MEDIA_AND_PLAYER_STATE') {
@@ -481,7 +519,11 @@ describe('HANDLE_USER_JOINED', () => {
 
     // Should not throw
     await eventhandlers.HANDLE_USER_JOINED(ctx, {
-      id: 'u1', username: 'Alice', state: 'playing', media: { ratingKey: 'movie-1' },
+      id: 'u1',
+      reconnectIdentity: 'alice-session',
+      username: 'Alice',
+      state: 'playing',
+      media: { ratingKey: 'movie-1' },
     });
   });
 });
@@ -492,7 +534,10 @@ describe('returning host media readiness', () => {
       IS_HOST_GRACE_PERIOD: true,
       GET_PENDING_HOST_ID: 'me-1',
       GET_HOST_GRACE_PREVIOUS_HOST_USERNAME: 'Alice',
-      GET_USER: () => ({ username: 'Alice', state: 'buffering', time: 5000 }),
+      GET_HOST_GRACE_PREVIOUS_HOST_IDENTITY: 'alice-session',
+      GET_USER: () => ({
+        reconnectIdentity: 'alice-session', username: 'Alice', state: 'buffering', time: 5000,
+      }),
     });
 
     await eventhandlers.HANDLE_MEDIA_UPDATE(ctx, {
@@ -601,6 +646,7 @@ describe('HANDLE_NEW_HOST', () => {
       const ctx = createMockContext({
         IS_HOST_GRACE_PERIOD: true,
         GET_HOST_GRACE_PREVIOUS_HOST_USERNAME: 'Alice',
+        GET_HOST_GRACE_PREVIOUS_HOST_IDENTITY: 'alice-session',
         GET_HOST_GRACE_PREVIOUS_HOST_STATE: 'playing',
         GET_USER: (id) => ({ username: id === 'alice-new' ? 'Alice' : `user-${id}`, state: 'playing', time: 0 }),
       });
@@ -616,6 +662,7 @@ describe('HANDLE_NEW_HOST', () => {
       const ctx = createMockContext({
         IS_HOST_GRACE_PERIOD: true,
         GET_HOST_GRACE_PREVIOUS_HOST_USERNAME: 'Alice',
+        GET_HOST_GRACE_PREVIOUS_HOST_IDENTITY: 'alice-session',
         GET_USER: (id) => ({ username: id === 'bob-1' ? 'Bob' : `user-${id}`, state: 'playing', time: 0 }),
       });
 
@@ -629,9 +676,12 @@ describe('HANDLE_NEW_HOST', () => {
       const ctx = createMockContext({
         IS_HOST_GRACE_PERIOD: true,
         GET_HOST_GRACE_PREVIOUS_HOST_USERNAME: 'Alice',
+        GET_HOST_GRACE_PREVIOUS_HOST_IDENTITY: 'alice-session',
         GET_HOST_GRACE_PREVIOUS_HOST_STATE: 'playing',
         GET_USER: (id) => (id === 'alice-new'
-          ? { username: 'Alice', state: 'buffering', media: null }
+          ? {
+            reconnectIdentity: 'alice-session', username: 'Alice', state: 'buffering', media: null,
+          }
           : { username: `user-${id}`, state: 'playing', media: { ratingKey: 'movie-1' } }),
       });
       Object.defineProperty(ctx.getters, 'GET_HOST_RESTORE_PENDING_ID', {
@@ -676,9 +726,12 @@ describe('HANDLE_NEW_HOST', () => {
       const ctx = createMockContext({
         IS_HOST_GRACE_PERIOD: true,
         GET_HOST_GRACE_PREVIOUS_HOST_USERNAME: 'Alice',
+        GET_HOST_GRACE_PREVIOUS_HOST_IDENTITY: 'alice-session',
         GET_HOST_GRACE_RESTORE_DEADLINE_AT: 2000,
         GET_USER: (id) => (id === 'alice-new'
-          ? { username: 'Alice', state: 'buffering', media: null }
+          ? {
+            reconnectIdentity: 'alice-session', username: 'Alice', state: 'buffering', media: null,
+          }
           : { username: `user-${id}`, state: 'playing', media: { ratingKey: 'movie-1' } }),
       });
       Object.defineProperty(ctx.getters, 'GET_HOST_RESTORE_PENDING_ID', {
@@ -714,10 +767,13 @@ describe('HANDLE_NEW_HOST', () => {
       const ctx = createMockContext({
         IS_HOST_GRACE_PERIOD: true,
         GET_HOST_GRACE_PREVIOUS_HOST_USERNAME: 'Alice',
+        GET_HOST_GRACE_PREVIOUS_HOST_IDENTITY: 'alice-session',
         GET_HOST_GRACE_PREVIOUS_HOST_STATE: 'playing',
         GET_HOST_GRACE_RESTORE_DEADLINE_AT: 1000,
         GET_USER: (id) => (id === 'alice-new'
-          ? { username: 'Alice', state: 'buffering', media: null }
+          ? {
+            reconnectIdentity: 'alice-session', username: 'Alice', state: 'buffering', media: null,
+          }
           : { username: `user-${id}`, state: 'playing', media: { ratingKey: 'movie-1' } }),
       });
       Object.defineProperty(ctx.getters, 'GET_HOST_RESTORE_PENDING_ID', {
@@ -795,6 +851,7 @@ describe('HANDLE_NEW_HOST', () => {
         IS_HOST_GRACE_PERIOD: true,
         GET_HOST_GRACE_TIMEOUT_ID: oldTimeout,
         GET_HOST_GRACE_PREVIOUS_HOST_USERNAME: 'Alice',
+        GET_HOST_GRACE_PREVIOUS_HOST_IDENTITY: 'alice-session',
         GET_HOST_ID: 'old-host',
         // new-host-2 username doesn't match Alice, so no reclaim
         GET_USER: (id) => ({ username: `user-${id}`, state: 'playing', time: 0 }),
@@ -816,6 +873,7 @@ describe('HANDLE_NEW_HOST', () => {
         GET_HOST_GRACE_RESTORE_DEADLINE_AT: 11000,
         GET_PENDING_HOST_ID: 'temporary-host-2',
         GET_HOST_GRACE_PREVIOUS_HOST_USERNAME: 'Alice',
+        GET_HOST_GRACE_PREVIOUS_HOST_IDENTITY: 'alice-session',
         GET_USER: (id) => ({ username: `user-${id}`, state: 'playing', time: 0 }),
       });
       Object.defineProperty(ctx.getters, 'GET_HOST_GRACE_TIMEOUT_ID', {
@@ -843,6 +901,7 @@ describe('HANDLE_NEW_HOST', () => {
         IS_HOST_GRACE_PERIOD: true,
         GET_PENDING_HOST_ID: 'me-1',
         GET_HOST_GRACE_PREVIOUS_HOST_USERNAME: 'Alice',
+        GET_HOST_GRACE_PREVIOUS_HOST_IDENTITY: 'alice-session',
       });
       Object.defineProperty(ctx.getters, 'GET_HOST_GRACE_TIMEOUT_ID', {
         get: () => timeoutId,
@@ -856,13 +915,21 @@ describe('HANDLE_NEW_HOST', () => {
       });
 
       await eventhandlers.HANDLE_USER_JOINED(ctx, {
-        id: 'returning-1', username: 'Alice', state: 'buffering', media: { ratingKey: 'movie-1' },
+        id: 'returning-1',
+        reconnectIdentity: 'alice-session',
+        username: 'Alice',
+        state: 'buffering',
+        media: { ratingKey: 'movie-1' },
       });
       const originalDeadline = restoreDeadline;
 
       await vi.advanceTimersByTimeAsync(29000);
       await eventhandlers.HANDLE_USER_JOINED(ctx, {
-        id: 'returning-2', username: 'Alice', state: 'buffering', media: { ratingKey: 'movie-1' },
+        id: 'returning-2',
+        reconnectIdentity: 'alice-session',
+        username: 'Alice',
+        state: 'buffering',
+        media: { ratingKey: 'movie-1' },
       });
 
       expect(restoreDeadline).toBe(originalDeadline);
@@ -874,9 +941,11 @@ describe('HANDLE_NEW_HOST', () => {
       let isGracePeriod = false;
       let pendingHostId = null;
       let timeoutId = null;
-      let previousHostUsername = null;
+      let previousHostIdentity = null;
       const users = {
-        'old-host': { username: 'Alice', state: 'playing', media: { ratingKey: 'movie-1' } },
+        'old-host': {
+          reconnectIdentity: 'alice-session', username: 'Alice', state: 'playing', media: { ratingKey: 'movie-1' },
+        },
         'me-1': { username: 'Temporary Host', state: 'playing', media: { ratingKey: 'movie-1' } },
       };
       const ctx = createMockContext({
@@ -886,15 +955,15 @@ describe('HANDLE_NEW_HOST', () => {
       Object.defineProperty(ctx.getters, 'IS_HOST_GRACE_PERIOD', { get: () => isGracePeriod });
       Object.defineProperty(ctx.getters, 'GET_PENDING_HOST_ID', { get: () => pendingHostId });
       Object.defineProperty(ctx.getters, 'GET_HOST_GRACE_TIMEOUT_ID', { get: () => timeoutId });
-      Object.defineProperty(ctx.getters, 'GET_HOST_GRACE_PREVIOUS_HOST_USERNAME', {
-        get: () => previousHostUsername,
+      Object.defineProperty(ctx.getters, 'GET_HOST_GRACE_PREVIOUS_HOST_IDENTITY', {
+        get: () => previousHostIdentity,
       });
       ctx.commit.mockImplementation((mutation, value) => {
         if (mutation === 'SET_IS_HOST_GRACE_PERIOD') isGracePeriod = value;
         if (mutation === 'SET_PENDING_HOST_ID') pendingHostId = value;
         if (mutation === 'SET_HOST_GRACE_TIMEOUT_ID') timeoutId = value;
-        if (mutation === 'SET_HOST_GRACE_PREVIOUS_HOST_USERNAME') {
-          previousHostUsername = value;
+        if (mutation === 'SET_HOST_GRACE_PREVIOUS_HOST_IDENTITY') {
+          previousHostIdentity = value;
         }
         if (mutation === 'SET_USER') users[value.id] = value.data;
       });
@@ -906,6 +975,7 @@ describe('HANDLE_NEW_HOST', () => {
       await vi.advanceTimersByTimeAsync(5000);
       await eventhandlers.HANDLE_USER_JOINED(ctx, {
         id: 'returning-host',
+        reconnectIdentity: 'alice-session',
         username: 'Alice',
         state: 'buffering',
         media: { ratingKey: 'movie-1' },
@@ -1018,7 +1088,11 @@ describe('HANDLE_NEW_HOST', () => {
 describe('HANDLE_PLAYER_STATE_UPDATE', () => {
   it('rechecks restoration readiness after canceling an in-progress sync', async () => {
     const returningUser = {
-      username: 'Alice', state: 'buffering', time: 5000, media: { ratingKey: 'movie-1' },
+      reconnectIdentity: 'alice-session',
+      username: 'Alice',
+      state: 'buffering',
+      time: 5000,
+      media: { ratingKey: 'movie-1' },
     };
     let restorePendingId = 'alice-new';
     let resolveCancel;
@@ -1056,7 +1130,11 @@ describe('HANDLE_PLAYER_STATE_UPDATE', () => {
 
   it('waits for the saved host state after server election', async () => {
     const returningUser = {
-      username: 'Alice', state: 'buffering', time: 5000, media: { ratingKey: 'movie-1' },
+      reconnectIdentity: 'alice-session',
+      username: 'Alice',
+      state: 'buffering',
+      time: 5000,
+      media: { ratingKey: 'movie-1' },
     };
     let restorePendingId = 'alice-new';
     const ctx = createMockContext({
@@ -1088,7 +1166,11 @@ describe('HANDLE_PLAYER_STATE_UPDATE', () => {
 
   it('performs a full sync when a server-elected returning host becomes ready', async () => {
     const returningUser = {
-      username: 'Alice', state: 'buffering', time: 5000, media: { ratingKey: 'movie-1' },
+      reconnectIdentity: 'alice-session',
+      username: 'Alice',
+      state: 'buffering',
+      time: 5000,
+      media: { ratingKey: 'movie-1' },
     };
     let restorePendingId = 'alice-new';
     const ctx = createMockContext({
@@ -1134,12 +1216,17 @@ describe('HANDLE_PLAYER_STATE_UPDATE', () => {
 
   it('does not reclaim on a transient paused update while the room is playing', async () => {
     const returningUser = {
-      username: 'Alice', state: 'buffering', time: 5000, media: { ratingKey: 'movie-1' },
+      reconnectIdentity: 'alice-session',
+      username: 'Alice',
+      state: 'buffering',
+      time: 5000,
+      media: { ratingKey: 'movie-1' },
     };
     const ctx = createMockContext({
       IS_HOST_GRACE_PERIOD: true,
       GET_PENDING_HOST_ID: 'me-1',
       GET_HOST_GRACE_PREVIOUS_HOST_USERNAME: 'Alice',
+      GET_HOST_GRACE_PREVIOUS_HOST_IDENTITY: 'alice-session',
       GET_HOST_GRACE_PREVIOUS_HOST_STATE: 'playing',
       GET_USER: (id) => (id === 'u1'
         ? returningUser
@@ -1161,12 +1248,17 @@ describe('HANDLE_PLAYER_STATE_UPDATE', () => {
 
   it('reclaims a returning host after restored playback reaches a stable state', async () => {
     const returningUser = {
-      username: 'Alice', state: 'buffering', time: 5000, media: { ratingKey: 'movie-1' },
+      reconnectIdentity: 'alice-session',
+      username: 'Alice',
+      state: 'buffering',
+      time: 5000,
+      media: { ratingKey: 'movie-1' },
     };
     const ctx = createMockContext({
       IS_HOST_GRACE_PERIOD: true,
       GET_PENDING_HOST_ID: 'me-1',
       GET_HOST_GRACE_PREVIOUS_HOST_USERNAME: 'Alice',
+      GET_HOST_GRACE_PREVIOUS_HOST_IDENTITY: 'alice-session',
       GET_USER: () => returningUser,
     });
     ctx.commit.mockImplementation((mutation, data) => {
@@ -1186,12 +1278,17 @@ describe('HANDLE_PLAYER_STATE_UPDATE', () => {
 
   it('allows a buffering host to reclaim after restoring stable playback', async () => {
     const returningUser = {
-      username: 'Alice', state: 'buffering', time: 5000, media: { ratingKey: 'movie-1' },
+      reconnectIdentity: 'alice-session',
+      username: 'Alice',
+      state: 'buffering',
+      time: 5000,
+      media: { ratingKey: 'movie-1' },
     };
     const ctx = createMockContext({
       IS_HOST_GRACE_PERIOD: true,
       GET_PENDING_HOST_ID: 'me-1',
       GET_HOST_GRACE_PREVIOUS_HOST_USERNAME: 'Alice',
+      GET_HOST_GRACE_PREVIOUS_HOST_IDENTITY: 'alice-session',
       GET_HOST_GRACE_PREVIOUS_HOST_STATE: 'buffering',
       GET_USER: () => returningUser,
     });
@@ -1237,6 +1334,56 @@ describe('HANDLE_PLAYER_STATE_UPDATE', () => {
   });
 
   describe('host non-host seek-follow guard', () => {
+    it('does not treat normal elapsed guest playback as a seek', async () => {
+      const ctx = createMockContext({
+        AM_I_HOST: true,
+        GET_SOCKET_ID: 'host-1',
+        GET_USER: (id) => ({
+          username: `user-${id}`,
+          state: 'playing',
+          time: 100000,
+          playbackRate: 1,
+          updatedAt: Date.now() - 10000,
+        }),
+      });
+
+      await eventhandlers.HANDLE_PLAYER_STATE_UPDATE(ctx, {
+        id: 'guest-1', state: 'playing', time: 110100, playbackRate: 1,
+      });
+
+      expect(ctx.dispatch).not.toHaveBeenCalledWith('CANCEL_IN_PROGRESS_SYNC');
+      expect(ctx.dispatch).not.toHaveBeenCalledWith(
+        'plexclients/SEEK_TO',
+        expect.anything(),
+        { root: true },
+      );
+    });
+
+    it('follows a real guest seek relative to expected playback progress', async () => {
+      const ctx = createMockContext({
+        AM_I_HOST: true,
+        GET_SOCKET_ID: 'host-1',
+        GET_USER: (id) => ({
+          username: `user-${id}`,
+          state: 'playing',
+          time: 100000,
+          playbackRate: 1,
+          updatedAt: Date.now() - 10000,
+        }),
+      });
+
+      await eventhandlers.HANDLE_PLAYER_STATE_UPDATE(ctx, {
+        id: 'guest-1', state: 'playing', time: 125000, playbackRate: 1,
+      });
+
+      expect(ctx.dispatch).toHaveBeenCalledWith('CANCEL_IN_PROGRESS_SYNC');
+      expect(ctx.dispatch).toHaveBeenCalledWith(
+        'plexclients/SEEK_TO',
+        expect.objectContaining({ offset: 125000 }),
+        { root: true },
+      );
+    });
+
     it('ignores non-host seek-like updates while host is changing source', async () => {
       const ctx = createMockContext({
         AM_I_HOST: true,
@@ -1306,5 +1453,78 @@ describe('HANDLE_PLAYER_STATE_UPDATE', () => {
         id: 'other-user',
       }));
     });
+  });
+});
+
+describe('host recovery identity boundary', () => {
+  it.each([undefined, 'another-session'])('rejects unverified host identity %s', async (reconnectIdentity) => {
+    const ctx = createMockContext({
+      IS_HOST_GRACE_PERIOD: true,
+      GET_PENDING_HOST_ID: 'me-1',
+      GET_HOST_GRACE_PREVIOUS_HOST_USERNAME: 'Alice',
+      GET_HOST_GRACE_PREVIOUS_HOST_THUMB: '/alice.png',
+      GET_HOST_GRACE_PREVIOUS_HOST_IDENTITY: 'original-session',
+    });
+    await eventhandlers.HANDLE_USER_JOINED(ctx, {
+      id: 'imposter',
+      username: 'Alice',
+      thumb: '/alice.png',
+      reconnectIdentity,
+      state: 'playing',
+      media: { ratingKey: '1' },
+    });
+    expect(ctx.dispatch).not.toHaveBeenCalledWith('TRANSFER_HOST', 'imposter');
+    expect(ctx.dispatch).not.toHaveBeenCalledWith('CLEAR_HOST_GRACE_PERIOD');
+  });
+});
+
+describe('buffering popup preference', () => {
+  it.each([true, false])('keeps state updates while popups are %s', async (enabled) => {
+    const ctx = createMockContext();
+    ctx.rootGetters['settings/GET_SHOW_BUFFERING_NOTIFICATIONS'] = enabled;
+    const update = { id: 'friend-1', state: 'buffering', time: 2000 };
+    await eventhandlers.HANDLE_PLAYER_STATE_UPDATE(ctx, update);
+    expect(ctx.commit).toHaveBeenCalledWith('SET_USER_PLAYER_STATE', update);
+    const popups = ctx.dispatch.mock.calls.filter(([action]) => action === 'DISPLAY_NOTIFICATION');
+    expect(popups).toHaveLength(enabled ? 1 : 0);
+  });
+});
+
+describe('repeated connection loss', () => {
+  afterEach(() => vi.resetAllMocks());
+
+  it('keeps recovery alive when the connection drops again during handshake', async () => {
+    getId.mockReturnValue('attempt-1');
+    isConnected.mockReturnValue(false);
+    waitForEvent.mockRejectedValueOnce(new Error('Disconnected while waiting for slPing'));
+    const ctx = createMockContext();
+    await eventhandlers.HANDLE_RECONNECT(ctx);
+    expect(ctx.dispatch).not.toHaveBeenCalledWith('DISCONNECT_AND_NAVIGATE_HOME');
+    expect(ctx.dispatch).not.toHaveBeenCalledWith('JOIN_ROOM_AND_INIT', expect.anything());
+  });
+
+  it('does not tear down a newer connection when an older join fails', async () => {
+    getId.mockReturnValue('attempt-1');
+    isConnected.mockReturnValue(true);
+    waitForEvent.mockResolvedValueOnce('ping');
+    const ctx = createMockContext();
+    ctx.dispatch.mockImplementation(async (action) => {
+      if (action === 'JOIN_ROOM_AND_INIT') {
+        getId.mockReturnValue('attempt-2');
+        throw new Error('old join interrupted');
+      }
+    });
+    await eventhandlers.HANDLE_RECONNECT(ctx);
+    expect(ctx.dispatch).not.toHaveBeenCalledWith('DISCONNECT_AND_NAVIGATE_HOME');
+  });
+
+  it('still reports a join failure on the current live connection', async () => {
+    getId.mockReturnValue('attempt-1');
+    isConnected.mockReturnValue(true);
+    waitForEvent.mockResolvedValueOnce('ping');
+    const ctx = createMockContext();
+    ctx.dispatch.mockRejectedValueOnce(new Error('join rejected'));
+    await eventhandlers.HANDLE_RECONNECT(ctx);
+    expect(ctx.dispatch).toHaveBeenCalledWith('DISCONNECT_AND_NAVIGATE_HOME');
   });
 });

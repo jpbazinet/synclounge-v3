@@ -1,4 +1,5 @@
-import shaka from 'shaka-player/dist/shaka-player.ui.debug';
+import { setCurrentTimeMs } from '@/player';
+import shaka from 'shaka-player/dist/shaka-player.ui';
 
 export default (store) => {
   class PreviousButton extends shaka.ui.Element {
@@ -49,7 +50,7 @@ export default (store) => {
       if (this.video.currentTime < 6) {
         store.dispatch('slplayer/PLAY_PREVIOUS');
       } else {
-        this.video.currentTime = 0;
+        setCurrentTimeMs(0, { userInitiated: true });
       }
     }
 

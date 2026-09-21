@@ -1,21 +1,35 @@
+import { beginRecovery, finishRecovery } from '@/utils/connectionstatus';
 import { CAF } from 'caf';
-import { emit, waitForEvent, getId } from '@/socket';
+import {
+  emit, waitForEvent, getId, isConnected,
+} from '@/socket';
 
-// Strip server-assigned dedup suffix like "(1)", "(2)" for username comparison.
-// When the same Plex user reconnects, the server may assign a different suffix.
-const stripUsernameSuffix = (name) => name?.replace(/\(\d+\)$/, '').trim();
-
-const matchesPreviousHost = (getters, user) => {
-  const thumbMatch = user?.thumb
-    && user.thumb === getters.GET_HOST_GRACE_PREVIOUS_HOST_THUMB;
-  const nameMatch = user?.username
-    && stripUsernameSuffix(user.username)
-      === stripUsernameSuffix(getters.GET_HOST_GRACE_PREVIOUS_HOST_USERNAME);
-  return thumbMatch || nameMatch;
-};
+const matchesPreviousHost = (getters, user) => Boolean(user?.reconnectIdentity
+  && user.reconnectIdentity === getters.GET_HOST_GRACE_PREVIOUS_HOST_IDENTITY);
 
 const hasRestoredPlayback = (user) => user?.media
   && (user.state === 'playing' || user.state === 'paused');
+
+const NON_HOST_SEEK_THRESHOLD_MS = 5000;
+
+const getExpectedUserTime = (user) => {
+  if (!Number.isFinite(user?.time)) return null;
+  if (user.state !== 'playing') return user.time;
+  if (!Number.isFinite(user.updatedAt)) return null;
+
+  const elapsed = Math.max(0, Date.now() - user.updatedAt);
+  const playbackRate = Number.isFinite(user.playbackRate) && user.playbackRate > 0
+    ? user.playbackRate
+    : 1;
+  return user.time + elapsed * playbackRate;
+};
+
+const isNonHostSeek = (previousUser, data, threshold = NON_HOST_SEEK_THRESHOLD_MS) => {
+  const expectedTime = getExpectedUserTime(previousUser);
+  return expectedTime != null
+    && Number.isFinite(data.time)
+    && Math.abs(data.time - expectedTime) > threshold;
+};
 
 const HOST_RESTORE_TIMEOUT = 30000;
 let partyPauseCommandQueue = Promise.resolve();
@@ -194,6 +208,7 @@ export default {
     commit('SET_PENDING_HOST_ID', null);
     commit('SET_HOST_GRACE_PREVIOUS_HOST_USERNAME', null);
     commit('SET_HOST_GRACE_PREVIOUS_HOST_THUMB', null);
+    commit('SET_HOST_GRACE_PREVIOUS_HOST_IDENTITY', null);
     commit('SET_HOST_GRACE_PREVIOUS_HOST_STATE', null);
     commit('SET_HOST_GRACE_RESTORE_DEADLINE_AT', null);
   },
@@ -300,12 +315,7 @@ export default {
     // If we're in a grace period and the original host reconnected, cancel the grace period
     // and keep the original host
     const newUser = getters.GET_USER(hostId);
-    const newThumbMatch = newUser?.thumb
-      && newUser.thumb === getters.GET_HOST_GRACE_PREVIOUS_HOST_THUMB;
-    const newNameMatch = getters.GET_HOST_GRACE_PREVIOUS_HOST_USERNAME
-      && stripUsernameSuffix(newUser?.username)
-        === stripUsernameSuffix(getters.GET_HOST_GRACE_PREVIOUS_HOST_USERNAME);
-    if (getters.IS_HOST_GRACE_PERIOD && (newThumbMatch || newNameMatch)) {
+    if (getters.IS_HOST_GRACE_PERIOD && matchesPreviousHost(getters, newUser)) {
       const expectedState = getters.GET_HOST_GRACE_PREVIOUS_HOST_STATE;
       const restoreDeadline = getters.GET_HOST_GRACE_RESTORE_DEADLINE_AT
         ?? Date.now() + HOST_RESTORE_TIMEOUT;
@@ -353,6 +363,7 @@ export default {
         }
         return;
       }
+      commit('SET_HOST_GRACE_PREVIOUS_HOST_IDENTITY', previousHost.reconnectIdentity || null);
       commit('SET_HOST_GRACE_PREVIOUS_HOST_USERNAME', previousHost.username);
       commit('SET_HOST_GRACE_PREVIOUS_HOST_THUMB', previousHost.thumb || null);
       commit(
@@ -379,23 +390,39 @@ export default {
     startHostGraceTimeout({ getters, commit, dispatch }, timeoutMs);
   },
 
-  HANDLE_DISCONNECT: async ({ dispatch }) => {
+  HANDLE_DISCONNECT: async ({ dispatch }, reason) => {
     invalidatePartyPauseCommands();
+    if (reason === 'io client disconnect') {
+      finishRecovery();
+      return;
+    }
+    dispatch('INVALIDATE_ROOM_JOIN');
     console.warn('HANDLE_DISCONNECT: lost connection to SyncLounge server');
-    await dispatch('DISPLAY_NOTIFICATION', {
-      text: 'Disconnected from the SyncLounge server',
-      color: 'info',
-    }, { root: true });
+    beginRecovery();
   },
 
-  HANDLE_RECONNECT: async ({ dispatch, commit }) => {
+  HANDLE_RECONNECT: async ({ dispatch, commit, getters }) => {
+    const wasHost = getters?.AM_I_HOST;
+    const reconnectSocketId = getId();
     console.debug('HANDLE_RECONNECT: attempting to rejoin room');
 
     try {
       await waitForEvent('slPing', 15000);
-      commit('SET_SOCKET_ID', getId());
-      await dispatch('JOIN_ROOM_AND_INIT');
+      if (!isConnected() || getId() !== reconnectSocketId) return;
+      commit('SET_SOCKET_ID', reconnectSocketId);
+      await dispatch('JOIN_ROOM_AND_INIT', { reconnecting: true });
+      if (!isConnected() || getId() !== reconnectSocketId) return;
+      finishRecovery();
+      if (wasHost && !getters.AM_I_HOST && getters.GET_HOST_USER?.username) {
+        await dispatch('DISPLAY_NOTIFICATION', {
+          text: `Host changed after reconnecting. ${getters.GET_HOST_USER.username} is now the host.`,
+          color: 'info',
+        }, { root: true });
+      }
     } catch (e) {
+      // A second outage must not let the abandoned attempt tear down the next connection.
+      if (e.name === 'AbortError' || !isConnected() || getId() !== reconnectSocketId) return;
+      finishRecovery();
       const text = `Error reconnecting: ${e.message}`;
       console.error(text);
       await dispatch('DISPLAY_NOTIFICATION', {
@@ -425,9 +452,8 @@ export default {
       return;
     }
 
-    const previousUser = getters.GET_USER(data.id);
+    const previousUser = { ...getters.GET_USER(data.id) };
     const previousState = previousUser?.state;
-    const previousTime = previousUser?.time;
     commit('SET_USER_PLAYER_STATE', data);
     commit('RECORD_USER_EVENT', { id: data.id, fields: ['player'] });
 
@@ -445,7 +471,8 @@ export default {
       return;
     }
 
-    if (data.state === 'buffering' && previousState !== 'buffering'
+    if (rootGetters['settings/GET_SHOW_BUFFERING_NOTIFICATIONS'] !== false
+      && data.state === 'buffering' && previousState !== 'buffering'
       && data.id !== getters.GET_SOCKET_ID) {
       const user = getters.GET_USER(data.id);
       if (user) {
@@ -464,14 +491,16 @@ export default {
     }
 
     if (data.id === getters.GET_HOST_ID) {
+      if (getters.GET_SYNC_CANCEL_TOKEN?.kind === 'media') return;
       await dispatch('CANCEL_IN_PROGRESS_SYNC');
       await dispatch('SYNC_PLAYER_STATE');
     } else if (data.id !== getters.GET_SOCKET_ID && getters.AM_I_HOST
       && !rootGetters['slplayer/IS_CHANGING_SOURCE']
       && !rootGetters['slplayer/IS_PLAY_QUEUE_TRANSITIONING']
-      && previousTime != null && Math.abs(data.time - previousTime) > 5000
+      && (data.userInitiatedSeek === true
+        || (data.userInitiatedSeek === undefined && isNonHostSeek(previousUser, data)))
       && data.state !== 'buffering') {
-      // Non-host user seeked (time jump > 5s) — follow their seek
+      // Older clients have no explicit seek marker; infer only large timeline discontinuities.
       const user = getters.GET_USER(data.id);
       console.debug('Non-host seek detected from', user?.username, 'seeking to', data.time);
       await dispatch('DISPLAY_NOTIFICATION', {
@@ -544,6 +573,16 @@ export default {
       await dispatch('CANCEL_IN_PROGRESS_SYNC');
       await dispatch('SYNC_MEDIA_AND_PLAYER_STATE');
     }
+  },
+
+  HANDLE_PARTICIPANT_HEALTH: ({ commit }, data) => {
+    commit('SET_PARTICIPANT_HEALTH', data);
+  },
+
+  HANDLE_SYNC_PRESET: async ({ commit, dispatch }, preset) => {
+    if (!['strict', 'balanced', 'relaxed', 'personal'].includes(preset)) return;
+    commit('SET_SYNC_PRESET', preset);
+    await dispatch('SEND_SYNC_FLEXIBILITY_UPDATE');
   },
 
   HANDLE_SYNC_FLEXIBILITY_UPDATE: ({ commit }, data) => {

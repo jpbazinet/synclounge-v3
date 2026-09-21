@@ -1,8 +1,8 @@
 const defaults = {
   servers: [
     {
-      name: 'Local Server',
-      location: 'Local',
+      name: 'This website’s service',
+      location: 'Recommended',
       url: '',
       image: 'synclounge-white.png',
     },
@@ -38,7 +38,6 @@ const defaults = {
 
   // Buffering goal in seconds
   slplayer_buffering_goal: 120,
-  slplayer_soft_seek_threshold: 200,
   sidebar_time_update_interval: 500,
 
   // If the plex client's time changes by this much from the expected time, trigger a state change
@@ -46,6 +45,7 @@ const defaults = {
   plex_auth_check_interval: 1000,
 
   socket_server_health_timeout: 2000,
+  socket_event_timeout: 15000,
 
   // TODO: investigate the average length of closing credits
   synclounge_upnext_trigger_time_from_end: 45000,

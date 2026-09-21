@@ -1,0 +1,203 @@
+#!/usr/bin/env node
+
+import express from 'express';
+import cors from 'cors';
+import http from 'http';
+import path from 'node:path';
+import { existsSync, realpathSync } from 'node:fs';
+import proxyaddr from 'proxy-addr';
+
+import { Server } from 'socket.io';
+import { createState } from './state';
+import { createActions } from './actions';
+import { createEventHandlers } from './handlers';
+import { createSocketAuthentication, createReconnectIdentity } from './authentication';
+import createAdmission from './admission';
+import { createHostPersistence } from './hostpersistence';
+
+const socketServer = ({
+  base_url: baseUrl, static_path: staticPath, port, ping_interval: pingInterval = 10000,
+  ping_timeout: pingTimeout = 10000, preStaticInjection, trust_proxy: trustProxy,
+  onRoomMediaUpdate, authentication, room_state_path: roomStatePath,
+  socket_max_connections: maxConnections = 512,
+  socket_max_per_ip: maxPerIp = 32,
+  socket_max_pending_auth: maxPending = 32,
+  socket_attempts_per_minute: attemptsPerMinute = 60,
+}) => {
+  if (!Number.isFinite(pingInterval) || pingInterval <= 0) {
+    throw new TypeError('ping_interval must be a positive number');
+  }
+  if (!Number.isFinite(pingTimeout) || pingTimeout <= 0) {
+    throw new TypeError('ping_timeout must be a positive number');
+  }
+  if (onRoomMediaUpdate != null && typeof onRoomMediaUpdate !== 'function') {
+    throw new TypeError('onRoomMediaUpdate must be a function');
+  }
+
+  if (roomStatePath && staticPath) {
+    const canonicalPath = (value) => {
+      let ancestor = path.resolve(value);
+      const missing = [];
+      while (!existsSync(ancestor)) {
+        missing.unshift(path.basename(ancestor));
+        ancestor = path.dirname(ancestor);
+      }
+      return path.join(realpathSync(ancestor), ...missing);
+    };
+    const isInside = (root, destination) => {
+      const relative = path.relative(root, destination);
+      return !relative.startsWith(`..${path.sep}`)
+        && relative !== '..' && !path.isAbsolute(relative);
+    };
+    // Atomic rename follows parent symlinks but replaces a final-component symlink.
+    const canonicalParent = canonicalPath(path.dirname(path.resolve(roomStatePath)));
+    const canonicalDestination = path.join(canonicalParent, path.basename(roomStatePath));
+    if (isInside(path.resolve(staticPath), path.resolve(roomStatePath))
+      || isInside(canonicalPath(staticPath), canonicalDestination)
+      || isInside(canonicalPath(staticPath), canonicalPath(roomStatePath))) {
+      throw new Error('room_state_path must be outside static_path');
+    }
+  }
+  const authenticate = createSocketAuthentication(authentication);
+  const hostPersistence = createHostPersistence(roomStatePath);
+  const reconnectIdentity = createReconnectIdentity(hostPersistence?.secret);
+  const app = express();
+  app.disable('x-powered-by');
+  app.use((req, res, next) => {
+    res.set({
+      'Content-Security-Policy': "base-uri 'self'; object-src 'none'; frame-ancestors 'none'",
+      'X-Frame-Options': 'DENY',
+      'X-Content-Type-Options': 'nosniff',
+      'Referrer-Policy': 'no-referrer',
+    });
+    next();
+  });
+  const server = http.Server(app);
+  // Bound transport-only clients, including those that never send namespace auth.
+  server.maxConnections = maxConnections * 2;
+  const admit = createAdmission({
+    maxConnections, maxPerIp, maxPending, attemptsPerMinute,
+  });
+  const router = express.Router();
+
+  if (trustProxy === true) {
+    throw new Error('trust_proxy=true is unsafe; configure a hop count, subnet, or named range');
+  }
+  app.set('trust proxy', trustProxy);
+
+  app.use(cors());
+
+  app.use(baseUrl, router);
+
+  const normalizedBaseUrl = `/${baseUrl}/`.replace(/\/{2,}/g, '/');
+  const socketPath = `${normalizedBaseUrl}socket.io`;
+
+  const socketio = new Server(server, {
+    path: socketPath,
+    cors: {
+      origin: '*',
+    },
+    serveClient: false,
+    maxHttpBufferSize: 64 * 1024,
+    // Use websockets first
+    transports: ['websocket', 'polling'],
+  });
+
+  socketio.use(async (socket, next) => {
+    const { data, handshake } = socket;
+    let lease;
+    try {
+      const address = proxyaddr(socket.request, app.get('trust proxy fn'));
+      lease = admit(address);
+      // Keep authentication work counted until it settles, even if the peer leaves.
+      await authenticate(socket.handshake.auth?.plexToken);
+      if (socket.conn.readyState !== 'open') {
+        lease.release();
+        return;
+      }
+      lease.authenticated();
+      socket.once('disconnect', lease.release);
+      socket.conn.once('close', lease.release);
+      const session = reconnectIdentity(socket.handshake.auth?.reconnectToken);
+      data.reconnectIdentity = session.identity;
+      data.reconnectToken = session.token;
+      // Do not retain the Plex credential after verification.
+      delete handshake.auth?.plexToken;
+      next();
+    } catch {
+      lease?.release();
+      delete handshake.auth?.plexToken;
+      next(new Error('Not authorized to use this SyncLounge server'));
+    } finally {
+      delete handshake.auth?.plexToken;
+    }
+  });
+  socketio.on('connection', (socket) => {
+    const { data } = socket;
+    socket.emit('session', { reconnectToken: data.reconnectToken });
+    delete data.reconnectToken;
+  });
+
+  const state = createState({ hostPersistence });
+  const actions = createActions(state);
+  const attachEventHandlers = createEventHandlers({ state, actions });
+  attachEventHandlers({
+    server: socketio,
+    pingInterval,
+    pingTimeout,
+    onRoomMediaUpdate,
+  });
+
+  router.get('/health', (req, res) => {
+    res.json(state.getHealth());
+  });
+
+  if (preStaticInjection) {
+    // User provided function that does something with the router before the static middleware is
+    // added.
+    // Useful when overriding static files with a custom result
+    preStaticInjection(router);
+  }
+
+  // Setup our router
+  if (staticPath) {
+    console.log('Serving static files at', staticPath);
+    router.use(express.static(staticPath));
+  } else {
+    router.get('/', (req, res) => {
+      res.send('You\'ve connected to the SLServer, you\'re probably looking for the webapp.');
+    });
+  }
+
+  router.ready = new Promise((resolve, reject) => {
+    const handleStartupError = (error) => reject(error);
+    server.once('error', handleStartupError);
+    server.listen(port, () => {
+      server.off('error', handleStartupError);
+      const address = server.address();
+      console.log('SyncLounge Server successfully started on port', address.port);
+      console.log('Running with base URL:', baseUrl);
+      resolve(address);
+    });
+  });
+
+  router.close = () => new Promise((resolve, reject) => {
+    hostPersistence?.close();
+    socketio.close(() => {
+      if (!server.listening) {
+        resolve();
+        return;
+      }
+      server.close((error) => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
+  });
+  router.address = () => server.address();
+
+  // Return router so users can attach more routes if desired
+  return router;
+};
+
+export default socketServer;

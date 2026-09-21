@@ -18,6 +18,7 @@ const loadToNumber = (load) => {
 const healthScore = (health) => health.latency + loadToNumber(health.load) * 10;
 
 export default {
+  GET_SYNC_PRESET_REVISION: (state) => state.syncPresetRevision,
   GET_MESSAGES_USER_CACHE_USER: (state) => (id) => state.messagesUserCache[id],
   GET_USER: (state, getters) => (id) => getters.GET_USERS[id],
   GET_SOCKET_ID: (state) => state.socketId,
@@ -89,6 +90,7 @@ export default {
 
   GET_HOST_GRACE_TIMEOUT_ID: (state) => state.hostGraceTimeoutId,
   IS_HOST_GRACE_PERIOD: (state) => state.isHostGracePeriod,
+  GET_HOST_GRACE_PREVIOUS_HOST_IDENTITY: (state) => state.hostGracePreviousHostIdentity,
   GET_HOST_GRACE_PREVIOUS_HOST_USERNAME: (state) => state.hostGracePreviousHostUsername,
   GET_HOST_GRACE_PREVIOUS_HOST_THUMB: (state) => state.hostGracePreviousHostThumb,
   GET_HOST_GRACE_PREVIOUS_HOST_STATE: (state) => state.hostGracePreviousHostState,

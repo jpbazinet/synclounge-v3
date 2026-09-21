@@ -1,4 +1,5 @@
 import { CAF } from 'caf';
+import { abortable, throwIfAborted } from '@/utils/cancellation';
 import eventhandlers from '@/store/modules/synclounge/eventhandlers';
 import { combineUrl, combineRelativeUrlParts } from '@/utils/combineurl';
 import { fetchJson } from '@/utils/fetchutils';
@@ -8,6 +9,17 @@ import {
 import notificationSound from '@/assets/sounds/notification_simple-01.wav';
 
 const notificationAudio = new Audio(notificationSound);
+const DEFAULT_SOCKET_EVENT_TIMEOUT = 15000;
+const MAX_TIMEOUT_MS = 2_147_483_647;
+
+const getSocketEventTimeout = (rootGetters) => {
+  const configuredTimeout = rootGetters.GET_CONFIG?.socket_event_timeout;
+  return Number.isSafeInteger(configuredTimeout)
+    && configuredTimeout > 0
+    && configuredTimeout <= MAX_TIMEOUT_MS
+    ? configuredTimeout
+    : DEFAULT_SOCKET_EVENT_TIMEOUT;
+};
 
 // Hold the requested party-pause state until the host confirms the matching command.
 let pendingPartyPause = null;
@@ -22,44 +34,103 @@ const clearPendingPartyPause = () => {
 
 // Cooldown after buffering ends — prevents aggressive sync from causing rebuffering loop.
 // The periodic 5s poll will handle sync after the player stabilizes.
-let lastBufferingEndTime = 0;
+let lastBufferingEndTime = null;
+let wasBuffering = false;
 const POST_BUFFERING_COOLDOWN_MS = 5000;
+
+const isRecoveringFromBuffering = (state) => {
+  if (state === 'stopped') {
+    wasBuffering = false;
+    lastBufferingEndTime = null;
+    return false;
+  }
+  if (state === 'buffering') {
+    wasBuffering = true;
+    return true;
+  }
+  if (wasBuffering) {
+    wasBuffering = false;
+    lastBufferingEndTime = Date.now();
+  }
+  return lastBufferingEndTime != null
+    && Date.now() - lastBufferingEndTime < POST_BUFFERING_COOLDOWN_MS;
+};
 
 // Visibility change handler reference for cleanup in DISCONNECT
 let visibilityChangeHandler = null;
+let roomJoinRevision = 0;
+const beginRoomJoin = () => {
+  roomJoinRevision += 1;
+  return roomJoinRevision;
+};
+const ensureRoomJoinCurrent = (revision) => {
+  if (revision !== roomJoinRevision) {
+    throw new DOMException('Room join was superseded', 'AbortError');
+  }
+};
+const invalidateRoomJoin = ({ commit }) => {
+  const revision = beginRoomJoin();
+  commit('SET_JOIN_SYNC_IN_PROGRESS', false);
+  return revision;
+};
 
 export default {
-  CONNECT_AND_JOIN_ROOM: async ({ dispatch }, options) => {
-    await dispatch('ESTABLISH_SOCKET_CONNECTION');
-    await dispatch('JOIN_ROOM_AND_INIT', options);
+  INVALIDATE_ROOM_JOIN: invalidateRoomJoin,
+
+  CONNECT_AND_JOIN_ROOM: async ({ dispatch }, { revision = beginRoomJoin(), ...options } = {}) => {
+    try {
+      ensureRoomJoinCurrent(revision);
+      await dispatch('ESTABLISH_SOCKET_CONNECTION', { revision });
+      ensureRoomJoinCurrent(revision);
+      await dispatch('JOIN_ROOM_AND_INIT', { ...options, revision });
+      ensureRoomJoinCurrent(revision);
+    } catch (error) {
+      ensureRoomJoinCurrent(revision);
+      if (error.name !== 'AbortError') await dispatch('DISCONNECT', { revision });
+      ensureRoomJoinCurrent(revision);
+      throw error;
+    }
   },
 
   SET_AND_CONNECT_AND_JOIN_ROOM: async (
     { commit, dispatch, rootGetters = {} },
     { server, room, syncOnJoin = true },
   ) => {
-    await dispatch('DISCONNECT_IF_CONNECTED');
+    const revision = beginRoomJoin();
+    try {
+      await dispatch('DISCONNECT_IF_CONNECTED', { revision });
+      ensureRoomJoinCurrent(revision);
 
-    commit('SET_SERVER', server);
-    commit('SET_ROOM', room);
+      commit('SET_SERVER', server);
+      commit('SET_ROOM', room);
 
-    if (rootGetters['plex/GET_PLEX_AUTH_TOKEN']) {
-      await dispatch('plex/FETCH_PLEX_USER', null, { root: true });
-      await dispatch('plex/FETCH_PLEX_DEVICES', null, { root: true });
+      if (rootGetters['plex/GET_PLEX_AUTH_TOKEN']) {
+        await dispatch('plex/FETCH_PLEX_USER', null, { root: true });
+        ensureRoomJoinCurrent(revision);
+        await dispatch('plex/FETCH_PLEX_DEVICES', null, { root: true });
+        ensureRoomJoinCurrent(revision);
+      }
+
+      return await dispatch('CONNECT_AND_JOIN_ROOM', { syncOnJoin, revision });
+    } catch (error) {
+      ensureRoomJoinCurrent(revision);
+      throw error;
     }
-
-    return dispatch('CONNECT_AND_JOIN_ROOM', { syncOnJoin });
   },
 
-  DISCONNECT_IF_CONNECTED: async ({ dispatch }) => {
+  DISCONNECT_IF_CONNECTED: async ({ dispatch }, options) => {
+    if (options) ensureRoomJoinCurrent(options.revision);
     if (isConnected() || hasSocket()) {
-      await dispatch('DISCONNECT');
+      await dispatch('DISCONNECT', options);
     }
   },
 
-  ESTABLISH_SOCKET_CONNECTION: async ({ getters, commit, dispatch }) => {
-    await dispatch('DISCONNECT_IF_CONNECTED');
-
+  ESTABLISH_SOCKET_CONNECTION: async ({
+    getters, rootGetters, commit, dispatch,
+  }, { revision = beginRoomJoin() } = {}) => {
+    ensureRoomJoinCurrent(revision);
+    await dispatch('DISCONNECT_IF_CONNECTED', { revision });
+    ensureRoomJoinCurrent(revision);
     const properBase = new URL(getters.GET_SERVER || '/', window.location.origin);
 
     const url = combineUrl('socket.io', properBase.toString());
@@ -67,9 +138,12 @@ export default {
 
     const { id } = await open(url.origin, {
       path: url.pathname,
+      auth: url.origin === window.location.origin && rootGetters.GET_CONFIG?.authentication?.mechanism === 'plex'
+        ? { plexToken: rootGetters['plex/GET_PLEX_AUTH_TOKEN'] } : {},
       transports: ['websocket', 'polling'],
     });
 
+    ensureRoomJoinCurrent(revision);
     commit('SET_SOCKET_ID', id);
 
     // Wait for initial slPing
@@ -78,19 +152,26 @@ export default {
     // handler might be fired first, which means it will do stuff before actually responding to the
     // ping(which the normal handler does). I am not very happy with this but I don't know of a easy
     // better way atm. Maybe reactive streams in the future, but that's a bit over my head now
-    const secret = await waitForEvent('slPing');
+    const eventTimeout = getSocketEventTimeout(rootGetters);
+    const secret = await waitForEvent('slPing', eventTimeout);
+    ensureRoomJoinCurrent(revision);
 
     // Explicitly handling the slping because we haven't registered the events yet
     await dispatch('HANDLE_SLPING', secret);
+    ensureRoomJoinCurrent(revision);
     await dispatch('ADD_EVENT_HANDLERS');
+    ensureRoomJoinCurrent(revision);
   },
 
-  JOIN_ROOM: async ({ getters, rootGetters, dispatch }) => {
+  JOIN_ROOM: async ({ getters, rootGetters, dispatch }, { revision = roomJoinRevision } = {}) => {
+    ensureRoomJoinCurrent(revision);
     const joinPlayerData = await dispatch(
       'plexclients/FETCH_JOIN_PLAYER_DATA',
       null,
       { root: true },
     );
+
+    ensureRoomJoinCurrent(revision);
 
     emit({
       eventName: 'join',
@@ -105,7 +186,9 @@ export default {
       },
     });
 
-    const { success, error, ...rest } = await waitForEvent('joinResult');
+    const eventTimeout = getSocketEventTimeout(rootGetters);
+    const { success, error, ...rest } = await waitForEvent('joinResult', eventTimeout);
+    ensureRoomJoinCurrent(revision);
     if (!success) {
       throw new Error(error);
     }
@@ -115,16 +198,23 @@ export default {
 
   JOIN_ROOM_AND_INIT: async ({
     getters, rootGetters, dispatch, commit,
-  }, { syncOnJoin = true } = {}) => {
+  }, { syncOnJoin = true, reconnecting = false, revision = beginRoomJoin() } = {}) => {
     // Note: this is also called on rejoining, so be careful not to register handlers twice
     // or duplicate tasks
+    ensureRoomJoinCurrent(revision);
     const joinStartRevision = getters.GET_USER_EVENT_REVISION || 0;
+    const presetRevision = getters.GET_SYNC_PRESET_REVISION || 0;
     const {
-      user: { id, ...rest }, users, isPartyPausingEnabled, isAutoHostEnabled, hostId,
-    } = await dispatch('JOIN_ROOM');
+      user: { id, ...rest }, users, isPartyPausingEnabled, isAutoHostEnabled, hostId, syncPreset,
+    } = await dispatch('JOIN_ROOM', { revision });
+    ensureRoomJoinCurrent(revision);
     clearPendingPartyPause();
     await dispatch('CLEAR_HOST_GRACE_PERIOD');
+    ensureRoomJoinCurrent(revision);
     await dispatch('CLEAR_HOST_RESTORE_PENDING');
+    ensureRoomJoinCurrent(revision);
+    const timeline = await dispatch('plexclients/FETCH_TIMELINE_POLL_DATA_CACHE', null, { root: true });
+    ensureRoomJoinCurrent(revision);
     const updatedAt = Date.now();
     const currentUsers = getters.GET_USERS;
     const eventRevisions = getters.GET_USER_EVENT_REVISIONS || {};
@@ -180,56 +270,74 @@ export default {
         playerProduct: rootGetters['plexclients/GET_CHOSEN_CLIENT']?.product,
         syncFlexibility: rootGetters['settings/GET_SYNCFLEXIBILITY'],
         updatedAt,
-        ...await dispatch('plexclients/FETCH_TIMELINE_POLL_DATA_CACHE', null, { root: true }),
+        ...timeline,
       },
     });
 
+    if ((getters.GET_SYNC_PRESET_REVISION || 0) === presetRevision) {
+      commit('SET_SYNC_PRESET', syncPreset ?? null);
+    }
     commit('SET_IS_PARTY_PAUSING_ENABLED', isPartyPausingEnabled);
     commit('SET_IS_AUTO_HOST_ENABLED', isAutoHostEnabled);
     commit('SET_IS_IN_ROOM', true);
+    await dispatch('SEND_SYNC_FLEXIBILITY_UPDATE');
+    ensureRoomJoinCurrent(revision);
 
-    await dispatch('DISPLAY_NOTIFICATION', {
-      text: 'Joined room',
-      color: 'success',
-    }, { root: true });
+    if (!reconnecting) {
+      await dispatch('DISPLAY_NOTIFICATION', {
+        text: 'Joined room',
+        color: 'success',
+      }, { root: true });
+      ensureRoomJoinCurrent(revision);
+    }
 
     if (syncOnJoin) {
       commit('SET_JOIN_SYNC_IN_PROGRESS', true);
       try {
         await dispatch('SYNC_MEDIA_AND_PLAYER_STATE');
       } finally {
-        commit('SET_JOIN_SYNC_IN_PROGRESS', false);
+        if (revision === roomJoinRevision) commit('SET_JOIN_SYNC_IN_PROGRESS', false);
       }
+      ensureRoomJoinCurrent(revision);
 
       // Schedule a delayed re-sync to catch up after initial media load settles
       setTimeout(() => {
-        if (getters.IS_IN_ROOM) {
+        if (revision === roomJoinRevision && getters.IS_IN_ROOM) {
           dispatch('SYNC_MEDIA_AND_PLAYER_STATE');
         }
       }, 2000);
-
-      // Start periodic sync polling to correct drift during continuous playback
-      dispatch('START_SYNC_POLL_INTERVAL');
-
-      // Re-sync when the tab becomes visible again (Chrome pauses video in background tabs)
-      if (visibilityChangeHandler) {
-        document.removeEventListener('visibilitychange', visibilityChangeHandler);
-      }
-      visibilityChangeHandler = () => {
-        if (document.visibilityState === 'visible' && getters.IS_IN_ROOM && !getters.AM_I_HOST) {
-          dispatch('SYNC_MEDIA_AND_PLAYER_STATE');
-        }
-      };
-      document.addEventListener('visibilitychange', visibilityChangeHandler);
     }
+
+    // Room maintenance must also run after a browse-only join.
+    dispatch('START_SYNC_POLL_INTERVAL');
+
+    // Re-sync when the tab becomes visible again (Chrome pauses video in background tabs)
+    if (visibilityChangeHandler) {
+      document.removeEventListener('visibilitychange', visibilityChangeHandler);
+    }
+    visibilityChangeHandler = () => {
+      if (document.visibilityState === 'visible' && getters.IS_IN_ROOM && !getters.AM_I_HOST) {
+        dispatch('SYNC_PLAYER_STATE');
+      }
+    };
+    document.addEventListener('visibilitychange', visibilityChangeHandler);
   },
 
-  DISCONNECT: async ({ commit, dispatch }) => {
+  DISCONNECT: async ({ commit, dispatch }, { revision = invalidateRoomJoin({ commit }) } = {}) => {
+    if (revision !== roomJoinRevision) return;
+    commit('SET_JOIN_SYNC_IN_PROGRESS', false);
+    isRecoveringFromBuffering('stopped');
+    await dispatch('plexclients/CANCEL_PLAY_MEDIA', null, { root: true });
+    if (revision !== roomJoinRevision) return;
     await dispatch('INVALIDATE_PARTY_PAUSE_COMMANDS');
+    if (revision !== roomJoinRevision) return;
     clearPendingPartyPause();
     await dispatch('CANCEL_IN_PROGRESS_SYNC');
+    if (revision !== roomJoinRevision) return;
     await dispatch('CANCEL_UPNEXT');
+    if (revision !== roomJoinRevision) return;
     await dispatch('STOP_SYNC_POLL_INTERVAL');
+    if (revision !== roomJoinRevision) return;
 
     // Clean up visibilitychange handler
     if (visibilityChangeHandler) {
@@ -239,7 +347,9 @@ export default {
 
     // Clean up host grace period timer
     await dispatch('CLEAR_HOST_GRACE_PERIOD');
+    if (revision !== roomJoinRevision) return;
     await dispatch('CLEAR_HOST_RESTORE_PENDING');
+    if (revision !== roomJoinRevision) return;
 
     close();
     commit('SET_IS_IN_ROOM', false);
@@ -374,7 +484,7 @@ export default {
     const eventNames = [
       'userJoined', 'userLeft', 'newHost', 'newMessage', 'slPing',
       'playerStateUpdate', 'mediaUpdate', 'syncFlexibilityUpdate',
-      'setPartyPausingEnabled', 'setAutoHostEnabled', 'partyPause',
+      'participantHealth', 'setSyncPreset', 'setPartyPausingEnabled', 'setAutoHostEnabled', 'partyPause',
       'partyPauseAck', 'disconnect', 'connect', 'kicked',
     ];
     eventNames.forEach((eventName) => off({ eventName }));
@@ -411,6 +521,8 @@ export default {
       eventName: 'setAutoHostEnabled',
       action: 'HANDLE_SET_AUTO_HOST_ENABLED',
     });
+    registerListener({ eventName: 'participantHealth', action: 'HANDLE_PARTICIPANT_HEALTH' });
+    registerListener({ eventName: 'setSyncPreset', action: 'HANDLE_SYNC_PRESET' });
     registerListener({ eventName: 'partyPause', action: 'HANDLE_PARTY_PAUSE' });
     registerListener({ eventName: 'partyPauseAck', action: 'HANDLE_PARTY_PAUSE_ACK' });
     registerListener({ eventName: 'disconnect', action: 'HANDLE_DISCONNECT' });
@@ -488,7 +600,9 @@ export default {
     }
   },
 
-  PROCESS_PLAYER_STATE_UPDATE: async ({ getters, dispatch, commit }, noSync) => {
+  PROCESS_PLAYER_STATE_UPDATE: async ({ getters, dispatch, commit }, options) => {
+    const noSync = typeof options === 'object' ? options?.noSync : options;
+    const userInitiatedSeek = options?.userInitiatedSeek === true;
     if (!getters.IS_IN_ROOM || !isConnected()) return;
 
     const playerState = await dispatch(
@@ -497,6 +611,8 @@ export default {
       { root: true },
     );
 
+    const inPostBufferingCooldown = isRecoveringFromBuffering(playerState.state);
+
     commit('SET_USER_PLAYER_STATE', {
       ...playerState,
       id: getters.GET_SOCKET_ID,
@@ -504,17 +620,12 @@ export default {
 
     emit({
       eventName: 'playerStateUpdate',
-      data: playerState,
+      data: { ...playerState, userInitiatedSeek },
     });
 
     await dispatch('PROCESS_UPNEXT', playerState);
 
-    if (playerState.state === 'buffering') {
-      lastBufferingEndTime = Date.now();
-      return;
-    }
-
-    const inPostBufferingCooldown = (Date.now() - lastBufferingEndTime) < POST_BUFFERING_COOLDOWN_MS;
+    if (playerState.state === 'buffering') return;
 
     if (!noSync && !getters.IS_JOIN_SYNC_IN_PROGRESS && !inPostBufferingCooldown) {
       await dispatch('SYNC_PLAYER_STATE');
@@ -544,7 +655,13 @@ export default {
       commit('SET_UP_NEXT_TRIGGERED', false);
     }
 
-    const media = rootGetters['plexclients/GET_ACTIVE_MEDIA_POLL_METADATA'];
+    const isStopped = playerState.state === 'stopped';
+    const media = isStopped
+      ? null
+      : rootGetters['plexclients/GET_ACTIVE_MEDIA_POLL_METADATA'];
+    const roomPreview = isStopped
+      ? null
+      : rootGetters['plexclients/GET_ACTIVE_MEDIA_ROOM_PREVIEW'];
 
     commit('SET_USER_MEDIA', {
       id: getters.GET_SOCKET_ID,
@@ -560,6 +677,7 @@ export default {
       eventName: 'mediaUpdate',
       data: {
         media,
+        roomPreview,
         ...playerState,
         userInitiated,
       },
@@ -687,6 +805,7 @@ export default {
 
     // eslint-disable-next-line new-cap
     const token = new CAF.cancelToken();
+    token.kind = 'media';
     commit('SET_SYNC_CANCEL_TOKEN', token);
 
     // Safety timeout: abort if sync takes too long, preventing token deadlock
@@ -698,7 +817,7 @@ export default {
     }, 30000);
 
     try {
-      await dispatch('_SYNC_MEDIA_AND_PLAYER_STATE', token.signal);
+      await abortable(dispatch('_SYNC_MEDIA_AND_PLAYER_STATE', token.signal), token.signal);
     } catch (e) {
       if (!token.signal.aborted) {
         console.error('Error in sync media logic:', e);
@@ -719,6 +838,17 @@ export default {
     if (!getters.GET_HOST_USER) {
       return;
     }
+    throwIfAborted(cancelSignal);
+    const hostId = getters.GET_HOST_ID;
+    const room = getters.GET_ROOM;
+    const { media } = getters.GET_HOST_USER;
+    const ensureCurrent = () => {
+      throwIfAborted(cancelSignal);
+      if (hostId !== getters.GET_HOST_ID || room !== getters.GET_ROOM
+        || media !== getters.GET_HOST_USER?.media) {
+        throw new DOMException('Host selection changed', 'AbortError');
+      }
+    };
     console.debug('_SYNC_MEDIA_AND_PLAYER_STATE');
     const timeline = await dispatch(
       'plexclients/FETCH_TIMELINE_POLL_DATA_CACHE',
@@ -726,11 +856,14 @@ export default {
       { root: true },
     );
 
+    throwIfAborted(cancelSignal);
     // Host may have left the room during the await above — re-check before use
     let hostUser = getters.GET_HOST_USER;
     if (!hostUser) {
       return;
     }
+
+    ensureCurrent();
 
     const stopIfNeeded = async () => {
       if (timeline.state !== 'stopped') {
@@ -738,6 +871,7 @@ export default {
           text: 'The host pressed stop',
           color: 'info',
         }, { root: true });
+        ensureCurrent();
         await dispatch('plexclients/PRESS_STOP', null, { root: true });
       }
     };
@@ -749,16 +883,18 @@ export default {
 
     // Logic for deciding whether we should play somethign different
     if (rootGetters['settings/GET_AUTOPLAY']) {
-      const bestMatch = await dispatch(
+      const bestMatch = await abortable(dispatch(
         'plexservers/FIND_BEST_MEDIA_MATCH',
-        hostUser.media,
+        { ...hostUser.media, signal: cancelSignal },
         { root: true },
-      );
+      ), cancelSignal);
+      throwIfAborted(cancelSignal);
       // Re-check host after await
       hostUser = getters.GET_HOST_USER;
       if (!hostUser) {
         return;
       }
+      ensureCurrent();
       console.debug('_SYNC_MEDIA_AND_PLAYER_STATE: match result:', {
         hostMedia: hostUser.media?.title,
         bestMatch: bestMatch ? { title: bestMatch.title, ratingKey: bestMatch.ratingKey } : null,
@@ -767,10 +903,13 @@ export default {
       if (bestMatch) {
         if (!rootGetters['plexclients/IS_THIS_MEDIA_PLAYING'](bestMatch)) {
           // If we aren't playing the best match, play it
-          await dispatch('PLAY_MEDIA_AND_SYNC_TIME', bestMatch);
+          await dispatch('PLAY_MEDIA_AND_SYNC_TIME', { ...bestMatch, signal: cancelSignal });
+          ensureCurrent();
+          if (getters.GET_HOST_USER.state !== 'stopped') {
+            await dispatch('_SYNC_PLAYER_STATE', cancelSignal);
+          }
           return;
         }
-        // TODO: fix
       } else {
         const text = `Failed to find a compatible copy of ${hostUser.media?.title ?? 'host media'
         }. If you have access to the content try manually playing it.`;
@@ -809,7 +948,7 @@ export default {
     }, 30000);
 
     try {
-      await dispatch('_SYNC_PLAYER_STATE', token.signal);
+      await abortable(dispatch('_SYNC_PLAYER_STATE', token.signal), token.signal);
     } catch (e) {
       if (!token.signal.aborted) {
         console.error('Error in sync player logic:', e);
@@ -829,6 +968,7 @@ export default {
     if (!getters.GET_HOST_USER) {
       return;
     }
+    throwIfAborted(cancelSignal);
     console.debug('_SYNC_PLAYER_STATE:', {
       hostState: getters.GET_HOST_USER.state,
       hostTime: getters.GET_HOST_USER.time,
@@ -839,6 +979,7 @@ export default {
       { root: true },
     );
 
+    throwIfAborted(cancelSignal);
     // Host may have left the room during the await above — re-check before use
     const hostUser = getters.GET_HOST_USER;
     if (!hostUser) {
@@ -861,6 +1002,7 @@ export default {
         text: 'Resuming..',
         color: 'info',
       }, { root: true });
+      throwIfAborted(cancelSignal);
       await dispatch('plexclients/PRESS_PLAY', cancelSignal, { root: true });
       // Fall through to SYNC below to also seek to the correct host position
     }
@@ -870,6 +1012,7 @@ export default {
         text: 'Pausing..',
         color: 'info',
       }, { root: true });
+      throwIfAborted(cancelSignal);
       await dispatch('plexclients/PRESS_PAUSE', cancelSignal, { root: true });
       return;
     }
@@ -879,15 +1022,22 @@ export default {
       return;
     }
 
+    // Polls and host events also reach this path, bypassing PROCESS_PLAYER_STATE_UPDATE.
+    // Let a recovering follower fill its buffer before another automatic correction.
+    // Host pause commands above and explicit MANUAL_SYNC remain available.
+    if (isRecoveringFromBuffering(timeline.state) && hostUser.state === 'playing') return;
+
     // TODO: potentially update the player state if we paused or played so we know in the sync
     await dispatch('plexclients/SYNC', cancelSignal, { root: true });
     console.debug('_SYNC_PLAYER_STATE: sync complete');
   },
 
   PLAY_MEDIA_AND_SYNC_TIME: async ({ getters, dispatch }, media) => {
+    throwIfAborted(media.signal);
     const offset = getters.GET_ADJUSTED_HOST_TIME();
 
     await dispatch('plexclients/PLAY_MEDIA', {
+      signal: media.signal,
       mediaIndex: media.mediaIndex || 0,
       // TODO: potentially play ahead a bit by the time it takes to buffer / transcode.
       offset: offset || 0,
@@ -914,7 +1064,16 @@ export default {
     }
   },
 
-  SEND_SYNC_FLEXIBILITY_UPDATE: ({ rootGetters }) => {
+  SEND_SYNC_PRESET: ({ getters }, preset) => {
+    if (getters.AM_I_HOST) emit({ eventName: 'setSyncPreset', data: preset });
+  },
+
+  SEND_SYNC_FLEXIBILITY_UPDATE: ({ getters, rootGetters, commit }) => {
+    if (getters.IS_IN_ROOM) {
+      commit('SET_USER_SYNC_FLEXIBILITY', {
+        id: getters.GET_SOCKET_ID, syncFlexibility: rootGetters['settings/GET_SYNCFLEXIBILITY'],
+      });
+    }
     emit({
       eventName: 'syncFlexibilityUpdate',
       data: rootGetters['settings/GET_SYNCFLEXIBILITY'],

@@ -1,46 +1,74 @@
 #!/usr/bin/env node
 
-const syncloungeServer = require('syncloungeserver');
+const { randomUUID } = require('node:crypto');
 const path = require('path');
 const fs = require('fs');
-const express = require('express');
-const { Readable } = require('node:stream');
+const syncloungeServer = require('./packages/syncloungeserver/dist/lib.js'); // eslint-disable-line import/extensions
 const config = require('./config');
-const { createCache } = require('./cache');
+const {
+  createCache,
+  roomMetadataCacheKey,
+  roomPosterMetadataCacheKey,
+  resolveRoomPosterMetadata,
+} = require('./cache');
+const { fetchPoster, PosterProxyError } = require('./poster-proxy');
+const { createDisconnectController } = require('./request-abort');
 
 const blockList = Object.keys(syncloungeServer.defaultConfig);
 const appConfig = config.get(null, blockList);
+const publicAppConfig = config.getPublic(appConfig);
+const socketConfig = syncloungeServer.getConfig();
 
-// Log config with sensitive values redacted
-const SENSITIVE_RE = /secret|password|token|key/i;
-const safeConfig = Object.fromEntries(
-  Object.entries(appConfig).map(([k, v]) => [k, SENSITIVE_RE.test(k) ? '[REDACTED]' : v]),
-);
-console.log(safeConfig);
+function parsePublicOrigin(value) {
+  if (!value) return null;
 
-const { setMetadata, getMetadata } = createCache();
-
-// --- SSRF prevention for poster proxy ---
-function isPrivateUrl(urlStr) {
   let parsed;
-  try { parsed = new URL(urlStr); } catch { return true; }
-  if (!['http:', 'https:'].includes(parsed.protocol)) return true;
-  // Strip IPv6 brackets for hostname comparison
-  const host = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
-  if (host === 'localhost' || host === '0.0.0.0') return true;
-  // IPv6 loopback and IPv4-mapped loopback
-  if (host === '::1' || host === '::ffff:127.0.0.1') return true;
-  if (/^0+:0+:0+:0+:0+:0+:0+:0*1$/.test(host)) return true; // expanded ::1
-  if (/^(127\.|10\.|192\.168\.|169\.254\.|0\.)/.test(host)) return true;
-  if (/^172\.(1[6-9]|2\d|3[01])\./.test(host)) return true;
-  return false;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new TypeError('PUBLIC_ORIGIN must be an absolute HTTP(S) origin');
+  }
+
+  if (!['http:', 'https:'].includes(parsed.protocol)
+    || parsed.username
+    || parsed.password
+    || parsed.pathname !== '/'
+    || parsed.search
+    || parsed.hash) {
+    throw new TypeError('PUBLIC_ORIGIN must be an absolute HTTP(S) origin');
+  }
+
+  return parsed.origin;
 }
+
+const publicOrigin = parsePublicOrigin(socketConfig.public_origin);
+const ROOM_POSTER_CACHE_MAX_SIZE = 1000;
+const ROOM_POSTER_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+
+const roomPosterPath = (room, revision) => (
+  `/share/room-poster/${encodeURIComponent(room)}/${encodeURIComponent(revision)}`
+);
+
+// Log exactly the browser-safe projection rather than deployment-only configuration.
+console.log(publicAppConfig);
+
+const { setMetadata, getMetadata, deleteMetadata } = createCache();
+const {
+  setMetadata: setRoomPosterMetadata,
+  getMetadata: getRoomPosterMetadata,
+} = createCache({
+  maxSize: ROOM_POSTER_CACHE_MAX_SIZE,
+  ttlMs: ROOM_POSTER_CACHE_TTL_MS,
+});
 
 // --- HTML escaping for XSS prevention ---
 function escapeHtml(str) {
   if (!str) return '';
-  return str.replace(/&/g, '&amp;').replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return str.replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
 
 // --- Read index.html once at startup ---
@@ -48,6 +76,13 @@ const distPath = path.join(__dirname, 'dist');
 let indexHtml = '';
 try {
   indexHtml = fs.readFileSync(path.join(distPath, 'index.html'), 'utf-8');
+  if (publicOrigin) {
+    // Use only the configured origin; request Host headers are not trusted for shared previews.
+    indexHtml = indexHtml.replace(
+      /(<meta\s+(?:property="og:image"|name="twitter:image")\s+content=")\/social-card\.png(")/g,
+      (match, prefix, suffix) => `${prefix}${escapeHtml(publicOrigin)}/social-card.png${suffix}`,
+    );
+  }
 } catch (e) {
   console.warn('Could not read dist/index.html at startup:', e.message);
 }
@@ -72,27 +107,75 @@ function injectOgTags(html, meta) {
     meta.posterProxyUrl ? `<meta property="og:image" content="${escapeHtml(meta.posterProxyUrl)}" />` : '',
     `<meta property="og:type" content="${ogType}" />`,
     '<meta property="og:site_name" content="SyncLounge" />',
-    '<meta name="theme-color" content="#E5A00D" />',
+    `<meta name="twitter:card" content="${meta.posterProxyUrl ? 'summary_large_image' : 'summary'}" />`,
+    `<meta name="twitter:title" content="${escapeHtml(title)}" />`,
+    meta.summary ? `<meta name="twitter:description" content="${escapeHtml(meta.summary)}" />` : '',
+    meta.posterProxyUrl ? `<meta name="twitter:image" content="${escapeHtml(meta.posterProxyUrl)}" />` : '',
   ].filter(Boolean).join('\n    ');
 
   // Remove existing OG/Twitter meta tags from the static HTML so we replace rather than duplicate
-  let cleaned = html.replace(/<meta\s+(?:property="og:[^"]*"|name="twitter:[^"]*"|name="theme-color")[^>]*\/?\s*>\s*\n?/g, '');
+  const cleaned = html.replace(
+    /<meta\s+(?:property="og:[^"]*"|name="twitter:[^"]*")[^>]*\/?\s*>\s*\n?/g,
+    '',
+  );
 
   return cleaned.replace('</head>', `    ${tags}\n  </head>`);
 }
 
 // --- In-memory rate limiter (sliding window, no external deps) ---
 // Limits configurable via env vars; set to 0 to disable (e.g. in tests)
-const METADATA_RATE_LIMIT = parseInt(process.env.SL_METADATA_RATE_LIMIT || '30', 10);
-const POSTER_RATE_LIMIT = parseInt(process.env.SL_POSTER_RATE_LIMIT || '60', 10);
+function parseRateLimit(name, defaultValue) {
+  const rawValue = process.env[name] ?? String(defaultValue);
+  if (!/^\d+$/.test(rawValue)) {
+    throw new TypeError(`${name} must be a non-negative integer`);
+  }
+  const parsedValue = Number(rawValue);
+  if (!Number.isSafeInteger(parsedValue)) {
+    throw new TypeError(`${name} must be a non-negative integer`);
+  }
+  return parsedValue;
+}
 
-function createRateLimiter(maxRequests, windowMs) {
-  if (maxRequests <= 0) return (req, res, next) => next();
+const POSTER_RATE_LIMIT = parseRateLimit('SL_POSTER_RATE_LIMIT', 60);
+const RATE_LIMIT_MAX_BUCKETS = parseRateLimit('SL_RATE_LIMIT_MAX_BUCKETS', 10000);
+const RATE_LIMIT_WINDOW_MS = parseRateLimit('SL_RATE_LIMIT_WINDOW_MS', 60 * 1000);
+if (RATE_LIMIT_MAX_BUCKETS === 0 || RATE_LIMIT_WINDOW_MS === 0) {
+  throw new TypeError('Rate-limit bucket count and window must be positive integers');
+}
+
+function createRateLimiter(maxRequests, windowMs, maxBuckets) {
+  if (!Number.isSafeInteger(maxRequests) || maxRequests < 0) {
+    throw new TypeError('Rate limit must be a non-negative integer');
+  }
+  if (maxRequests === 0) return (req, res, next) => next();
   const hits = new Map(); // ip -> [timestamp, ...]
+  let nextPruneAt = Date.now() + windowMs;
+
+  const pruneExpiredBuckets = (cutoff) => {
+    for (const [ip, timestamps] of hits) {
+      const activeTimestamps = timestamps.filter((timestamp) => timestamp > cutoff);
+      if (activeTimestamps.length === 0) {
+        hits.delete(ip);
+      } else {
+        hits.set(ip, activeTimestamps);
+      }
+    }
+  };
+
   return (req, res, next) => {
-    const ip = req.ip;
+    const { ip } = req;
     const now = Date.now();
     const cutoff = now - windowMs;
+
+    if (now >= nextPruneAt) {
+      pruneExpiredBuckets(cutoff);
+      nextPruneAt = now + windowMs;
+    }
+
+    if (!hits.has(ip) && hits.size >= maxBuckets) {
+      return res.status(429).json({ error: 'Too many clients' });
+    }
+
     let timestamps = hits.get(ip);
     if (timestamps) {
       timestamps = timestamps.filter((t) => t > cutoff);
@@ -108,99 +191,99 @@ function createRateLimiter(maxRequests, windowMs) {
   };
 }
 
-const metadataLimiter = createRateLimiter(METADATA_RATE_LIMIT, 60 * 1000);
-const posterLimiter = createRateLimiter(POSTER_RATE_LIMIT, 60 * 1000);
+const posterLimiter = createRateLimiter(
+  POSTER_RATE_LIMIT,
+  RATE_LIMIT_WINDOW_MS,
+  RATE_LIMIT_MAX_BUCKETS,
+);
 
 // --- File extension check for SPA fallback ---
 const STATIC_EXT_RE = /\.\w{2,}$/;
+const ROOM_POSTER_MAX_AGE_SECONDS = 60;
+const ROOM_PREVIEW_FIELDS = [
+  'title',
+  'year',
+  'summary',
+  'type',
+  'posterUrl',
+  'machineIdentifier',
+  'ratingKey',
+  'grandparentTitle',
+  'parentIndex',
+  'index',
+];
+
+function decodePathSegment(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return null;
+  }
+}
+
+async function proxyPoster(meta, req, res, cacheControl = 'public, max-age=86400') {
+  if (!meta?.posterUrl) {
+    return res.status(404).send('Not found');
+  }
+
+  const disconnect = createDisconnectController(req, res);
+
+  try {
+    const allowedPrivateOrigin = process.env.NODE_ENV === 'test'
+      ? process.env.SL_POSTER_TEST_ORIGIN
+      : undefined;
+    const poster = await fetchPoster(meta.posterUrl, {
+      allowedPrivateOrigin,
+      signal: disconnect.signal,
+    });
+    if (disconnect.signal.aborted) return undefined;
+
+    res.set('Content-Type', poster.contentType);
+    res.set('Cache-Control', cacheControl);
+    return res.send(poster.body);
+  } catch (error) {
+    if (disconnect.signal.aborted) return undefined;
+
+    console.error('Poster proxy error:', error.message);
+    const statusCode = error instanceof PosterProxyError ? error.statusCode : 502;
+    return res.status(statusCode).send(statusCode === 403 ? 'Forbidden' : 'Failed to fetch poster');
+  } finally {
+    disconnect.cleanup();
+  }
+}
 
 const preStaticInjection = (router) => {
+  // Revalidate stable PWA entry points so installed clients can discover updates.
+  router.get(['/sw.js', '/manifest.webmanifest'], (req, res, next) => {
+    res.set('Cache-Control', 'no-cache');
+    if (req.path === '/manifest.webmanifest') res.type('application/manifest+json');
+    next();
+  });
+
   // Add route for config
   router.get('/config.json', (req, res) => {
-    res.json(appConfig);
+    res.json(publicAppConfig);
   });
 
-  // --- POST /api/metadata: receive metadata from client ---
-  router.post('/api/metadata', express.json(), metadataLimiter, (req, res) => {
-    const {
-      title, year, summary, type, posterUrl, machineIdentifier, ratingKey,
-      grandparentTitle, parentIndex, index, room,
-    } = req.body;
+  // Legacy global metadata writes had no ownership boundary. Only socket-host
+  // snapshots may supply shared previews now.
+  router.post('/api/metadata', (req, res) => res.status(410).json({ error: 'Use room previews' }));
+  router.get('/share/poster/:machineIdentifier/:ratingKey', (req, res) => res.sendStatus(410));
 
-    if (!machineIdentifier || !ratingKey) {
-      return res.status(400).json({ error: 'machineIdentifier and ratingKey are required' });
-    }
-
-    // Validate string fields have correct types and reasonable lengths
-    const MAX_LEN = 500;
-    const stringFields = { title, summary, type, posterUrl, grandparentTitle };
-    for (const [name, val] of Object.entries(stringFields)) {
-      if (val != null && (typeof val !== 'string' || val.length > MAX_LEN)) {
-        return res.status(400).json({ error: `${name} must be a string of at most ${MAX_LEN} characters` });
-      }
-    }
-    // machineIdentifier and ratingKey can be string or number (coerced via template literals)
-    for (const [name, val] of Object.entries({ machineIdentifier, ratingKey })) {
-      if (val != null && typeof val !== 'string' && typeof val !== 'number') {
-        return res.status(400).json({ error: `${name} must be a string or number` });
-      }
-      if (typeof val === 'string' && val.length > MAX_LEN) {
-        return res.status(400).json({ error: `${name} must be at most ${MAX_LEN} characters` });
-      }
-    }
-    if (year != null && (typeof year !== 'string' && typeof year !== 'number')) {
-      return res.status(400).json({ error: 'year must be a string or number' });
-    }
-    if (room != null && (typeof room !== 'string' || room.length > MAX_LEN)) {
-      return res.status(400).json({ error: 'room must be a string of at most 500 characters' });
-    }
-
-    const key = `${machineIdentifier}\0${ratingKey}`;
-    const meta = {
-      title, year, summary, type, posterUrl,
-      machineIdentifier, ratingKey,
-      grandparentTitle, parentIndex, index,
-    };
-    setMetadata(key, meta);
-
-    // Also index by room code so /join/:room gets OG tags
-    if (room) {
-      setMetadata(`room\0${room}`, meta);
-    }
-
-    return res.json({ ok: true });
-  });
-
-  // --- GET /share/poster/:machineIdentifier/:ratingKey: proxy poster images ---
-  router.get('/share/poster/:machineIdentifier/:ratingKey', posterLimiter, async (req, res) => {
-    const key = `${req.params.machineIdentifier}\0${req.params.ratingKey}`;
-    const meta = getMetadata(key);
-
-    if (!meta || !meta.posterUrl) {
-      return res.status(404).send('Not found');
-    }
-
-    if (isPrivateUrl(meta.posterUrl)) {
-      return res.status(403).send('Forbidden');
-    }
-
-    try {
-      const response = await fetch(meta.posterUrl, {
-        redirect: 'error',
-        signal: AbortSignal.timeout(10000),
-      });
-      if (!response.ok) {
-        return res.status(502).send('Failed to fetch poster');
-      }
-
-      res.set('Content-Type', response.headers.get('content-type') || 'image/jpeg');
-      res.set('Cache-Control', 'public, max-age=86400');
-
-      Readable.fromWeb(response.body).pipe(res);
-    } catch (e) {
-      console.error('Poster proxy error:', e.message);
-      return res.status(502).send('Failed to fetch poster');
-    }
+  // Room poster snapshots can only be selected by the current socket host.
+  router.get('/share/room-poster/:room/:revision', posterLimiter, async (req, res) => {
+    const meta = resolveRoomPosterMetadata({
+      room: req.params.room,
+      revision: req.params.revision,
+      getCurrentMetadata: getMetadata,
+      getSnapshotMetadata: getRoomPosterMetadata,
+    });
+    return proxyPoster(
+      meta,
+      req,
+      res,
+      `public, max-age=${ROOM_POSTER_MAX_AGE_SECONDS}`,
+    );
   });
 
   // --- SPA fallback middleware ---
@@ -224,42 +307,33 @@ const preStaticInjection = (router) => {
       return res.status(500).send('index.html not available');
     }
 
-    // Check if this is a media browse route we can inject OG tags for
+    // Navigation HTML may contain the current room's selected media preview.
+    res.set('Cache-Control', 'no-store');
+
+    // A browse link may expose only this room's current host-selected media.
     const mediaMatch = req.path.match(
-      /^\/room\/[^/]+\/browse\/server\/([^/]+)\/ratingKey\/([^/]+)/,
+      /^\/room\/([^/]+)\/browse\/server\/([^/]+)\/ratingKey\/([^/]+)\/?$/,
     );
-
     if (mediaMatch) {
-      const [, machineIdentifier, ratingKey] = mediaMatch;
-      const key = `${machineIdentifier}\0${ratingKey}`;
-      const meta = getMetadata(key);
-
-      if (meta) {
-        const protocol = req.headers['x-forwarded-proto'] || req.protocol;
-        const host = req.headers['x-forwarded-host'] || req.get('host');
-        const baseUrl = `${protocol}://${host}`;
-        const posterProxyUrl = meta.posterUrl
-          ? `${baseUrl}/share/poster/${machineIdentifier}/${ratingKey}`
-          : null;
-
-        const html = injectOgTags(indexHtml, { ...meta, posterProxyUrl });
-        res.set('Content-Type', 'text/html');
-        return res.send(html);
+      const [, room, machine, rating] = mediaMatch.map(decodePathSegment);
+      const meta = room == null ? null : getMetadata(roomMetadataCacheKey(room));
+      if (meta && String(meta.machineIdentifier) === machine && String(meta.ratingKey) === rating) {
+        const posterProxyUrl = meta.posterUrl && publicOrigin
+          ? `${publicOrigin}${roomPosterPath(room, meta.roomPreviewRevision)}` : null;
+        res.type('html');
+        return res.send(injectOgTags(indexHtml, { ...meta, posterProxyUrl }));
       }
     }
 
     // Check if this is a room invite link — inject OG tags for current room media
     const roomMatch = req.path.match(/^\/join\/([^/]+)/);
     if (roomMatch) {
-      const [, roomCode] = roomMatch;
-      const meta = getMetadata(`room\0${roomCode}`);
+      const roomCode = decodePathSegment(roomMatch[1]);
+      const meta = roomCode != null ? getMetadata(roomMetadataCacheKey(roomCode)) : null;
 
       if (meta) {
-        const protocol = req.headers['x-forwarded-proto'] || req.protocol;
-        const host = req.headers['x-forwarded-host'] || req.get('host');
-        const baseUrl = `${protocol}://${host}`;
-        const posterProxyUrl = meta.posterUrl
-          ? `${baseUrl}/share/poster/${meta.machineIdentifier}/${meta.ratingKey}`
+        const posterProxyUrl = meta.posterUrl && publicOrigin
+          ? `${publicOrigin}${roomPosterPath(roomCode, meta.roomPreviewRevision)}`
           : null;
 
         const html = injectOgTags(indexHtml, { ...meta, posterProxyUrl });
@@ -268,23 +342,42 @@ const preStaticInjection = (router) => {
       }
     }
 
-    // Serve index.html with default OG tags for all other SPA routes
-    const defaultOg = [
-      '<meta property="og:title" content="SyncLounge" />',
-      '<meta property="og:description" content="Watch Plex together with your friends" />',
-      '<meta property="og:type" content="website" />',
-      '<meta property="og:site_name" content="SyncLounge" />',
-      '<meta name="theme-color" content="#E5A00D" />',
-    ].join('\n    ');
-    const html = indexHtml.replace('</head>', `    ${defaultOg}\n  </head>`);
+    // Default metadata belongs to the built document, shared with static hosting.
     res.set('Content-Type', 'text/html');
-    return res.send(html);
+    return res.send(indexHtml);
   });
 };
 
-const socketConfig = syncloungeServer.getConfig();
+const onRoomMediaUpdate = ({ roomId, roomPreview }) => {
+  const roomKey = roomMetadataCacheKey(roomId);
+  if (!roomPreview) {
+    deleteMetadata(roomKey);
+    return;
+  }
+  const currentPreview = getMetadata(roomKey);
+  const previewUnchanged = currentPreview != null
+    && ROOM_PREVIEW_FIELDS.every(
+      (fieldName) => Object.is(currentPreview[fieldName], roomPreview[fieldName]),
+    );
+  if (previewUnchanged) {
+    setMetadata(roomKey, currentPreview);
+    return;
+  }
+  const previewSnapshot = {
+    ...roomPreview,
+    roomPreviewRevision: randomUUID(),
+  };
+  setMetadata(roomKey, previewSnapshot);
+  setRoomPosterMetadata(
+    roomPosterMetadataCacheKey(roomId, previewSnapshot.roomPreviewRevision),
+    previewSnapshot,
+  );
+};
+
 syncloungeServer.socketServer({
   ...socketConfig,
+  authentication: appConfig.authentication,
   static_path: path.join(__dirname, 'dist'),
   preStaticInjection,
+  onRoomMediaUpdate,
 });

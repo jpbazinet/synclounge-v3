@@ -1,22 +1,123 @@
 import { CAF } from 'caf';
+import createStreamRecovery, { waitForVideoReady } from '@/utils/streamrecovery';
+import recommendLowerQuality from '@/utils/qualityrecovery';
+import { rememberDiagnostic } from '@/utils/problemreport';
+import { consumeUserSeekIntent, hasPendingUserSeek, recordSeekIntent } from '@/player/seekIntent';
+import { abortable, throwIfAborted } from '@/utils/cancellation';
 
 import { getRandomPlexId } from '@/utils/random';
 import { fetchJson, queryFetch } from '@/utils/fetchutils';
+import { getVideoSupportDetails } from '@/utils/mediasupport';
+import { summarizePlayerError } from '@/utils/playbackdiagnostics';
+import { emit, isConnected } from '@/socket';
 import {
   play, pause, getDurationMs, getCurrentTimeMs, isTimeInBufferedRange,
   isMediaElementAttached, isPlaying, isPresentationPaused, isBuffering, getVolume, isPaused,
   waitForMediaElementEvent, destroy, cancelTrickPlay, load, setPlaybackRate, getPlaybackRate,
   setCurrentTimeMs, setVolume, addEventListener, removeEventListener, areControlsShown,
   getSmallPlayButton, getBigPlayButton, unload, isCasting, getMediaElement,
-  addCastStatusListener, removeCastStatusListener,
+  addCastStatusListener, removeCastStatusListener, getPlaybackDiagnostics,
 } from '@/player';
 import Deferred from '@/utils/deferredpromise';
 import subtitleActions from './subtitleActions';
 
 // Module-level guard for play queue transitions (not reactive, so reads are synchronous)
 let isPlayQueueTransitioning = false;
+let sourceRevision = 0;
+let isPlayerStopping = false;
+const streamRecovery = createStreamRecovery();
+let bufferingStartedAt = null;
+let bufferingEpisode = 0;
+let lastHealthDiagnosticAt = 0;
+
+const HEALTH_DIAGNOSTIC_INTERVAL_MS = 60 * 1000;
+
+const summarizeStream = (stream) => (stream ? Object.fromEntries([
+  'streamType',
+  'codec',
+  'profile',
+  'level',
+  'bitDepth',
+  'bitrate',
+  'width',
+  'height',
+  'frameRate',
+  'colorPrimaries',
+  'colorSpace',
+  'colorTrc',
+  'decision',
+  'selected',
+].filter((key) => stream[key] !== undefined).map((key) => [key, stream[key]])) : null);
 
 export default {
+  REPORT_PLAYBACK_DIAGNOSTIC: ({ state, getters, rootGetters }, {
+    event,
+    details = null,
+  }) => {
+    if (!rootGetters['synclounge/IS_IN_ROOM'] || !isConnected()) return;
+
+    const now = Date.now();
+    if (event === 'playback-health') {
+      if (now - lastHealthDiagnosticAt < HEALTH_DIAGNOSTIC_INTERVAL_MS) return;
+      lastHealthDiagnosticAt = now;
+    }
+
+    const browser = rootGetters.GET_BROWSER || {};
+    const sourceVideo = getters.GET_STREAMS.find(({ streamType }) => streamType === 1);
+    const sourceAudio = getters.GET_STREAMS.find(({ streamType, selected }) => (
+      streamType === 2 && selected
+    ));
+    const decisionPart = getters.GET_DECISION_PART;
+    const decisionVideo = decisionPart?.Stream?.find(({ streamType }) => streamType === 1);
+    const decisionAudio = decisionPart?.Stream?.find(({ streamType }) => streamType === 2);
+    const request = getters.GET_DECISION_AND_START_PARAMS;
+
+    const diagnostic = {
+      event,
+      clientTimestamp: new Date(now).toISOString(),
+      browser: {
+        name: browser.name,
+        version: browser.version,
+        os: browser.os,
+        type: browser.type,
+        userAgent: globalThis.navigator?.userAgent,
+      },
+      sessions: {
+        plex: getters.GET_X_PLEX_SESSION_ID,
+        transcode: state.session,
+      },
+      stream: {
+        ratingKey: rootGetters['plexclients/GET_ACTIVE_MEDIA_METADATA']?.ratingKey,
+        sourceVideo: summarizeStream(sourceVideo),
+        sourceAudio: summarizeStream(sourceAudio),
+        videoSupport: sourceVideo ? getVideoSupportDetails(sourceVideo) : null,
+        request: {
+          protocol: getters.GET_STREAMING_PROTOCOL,
+          directPlay: request.directPlay,
+          directStream: request.directStream,
+          directStreamAudio: request.directStreamAudio,
+          videoCodec: request.videoCodec,
+          audioCodec: request.audioCodec,
+          maxVideoBitrate: request.maxVideoBitrate,
+          forceTranscode: getters.GET_FORCE_TRANSCODE,
+          allowDirectPlay: state.allowDirectPlay,
+          canDirectStreamHevc: getters.GET_CAN_DIRECT_STREAM_HEVC_VIDEO,
+        },
+        decision: {
+          part: decisionPart?.decision,
+          video: summarizeStream(decisionVideo),
+          audio: summarizeStream(decisionAudio),
+          directPlayCode: getters.GET_PLEX_DECISION?.MediaContainer?.directPlayDecisionCode,
+          transcodeCode: getters.GET_PLEX_DECISION?.MediaContainer?.transcodeDecisionCode,
+        },
+      },
+      playback: getPlaybackDiagnostics(),
+      details,
+    };
+    rememberDiagnostic(diagnostic);
+    emit({ eventName: 'playbackDiagnostic', data: diagnostic });
+  },
+
   MAKE_TIMELINE_PARAMS: async ({ getters, rootGetters, dispatch }) => ({
     ratingKey: rootGetters['plexclients/GET_ACTIVE_MEDIA_METADATA']?.ratingKey,
     key: rootGetters['plexclients/GET_ACTIVE_MEDIA_METADATA']?.key,
@@ -34,9 +135,11 @@ export default {
     ? getters.GET_OFFSET_MS
     : getCurrentTimeMs() || getters.GET_OFFSET_MS),
 
-  SEND_PLEX_DECISION_REQUEST: async ({ getters, commit }) => {
+  SEND_PLEX_DECISION_REQUEST: async ({ getters, commit, dispatch }, { signal, ensureCurrent = () => {} } = {}) => {
     console.debug('SEND_PLEX_DECISION_REQUEST:', getters.GET_DECISION_URL);
-    const data = await fetchJson(getters.GET_DECISION_URL, getters.GET_DECISION_AND_START_PARAMS);
+    const data = await fetchJson(getters.GET_DECISION_URL, getters.GET_DECISION_AND_START_PARAMS, { signal });
+    throwIfAborted(signal);
+    ensureCurrent();
     const meta = data?.MediaContainer?.Metadata?.[0];
     const part = meta?.Media?.[0]?.Part?.[0];
     console.debug('Plex decision:', {
@@ -49,6 +152,14 @@ export default {
     });
     commit('SET_PLEX_DECISION', data);
     commit('SET_SUBTITLE_OFFSET', parseInt(getters.GET_SUBTITLE_STREAM?.offset || 0, 10));
+    dispatch('REPORT_PLAYBACK_DIAGNOSTIC', { event: 'stream-decision' });
+  },
+
+  ACCEPT_QUALITY_RECOMMENDATION: async ({ state, dispatch, commit }) => {
+    const recommendation = state.qualityRecommendation;
+    if (!recommendation || state.isChangingSource) return;
+    commit('SET_QUALITY_RECOMMENDATION', null);
+    await dispatch('CHANGE_MAX_VIDEO_BITRATE', recommendation.maxVideoBitrate);
   },
 
   CHANGE_MAX_VIDEO_BITRATE: async ({ commit, dispatch }, bitrate) => {
@@ -88,9 +199,13 @@ export default {
   },
 
   // Changes the player src to the new one and restores the time afterwards
-  UPDATE_PLAYER_SRC_AND_KEEP_TIME: async ({ commit, dispatch }) => {
-    commit('SET_OFFSET_MS', await dispatch('FETCH_PLAYER_CURRENT_TIME_MS_OR_FALLBACK'));
-    await dispatch('CHANGE_PLAYER_SRC');
+  UPDATE_PLAYER_SRC_AND_KEEP_TIME: async ({ commit, dispatch }, options) => {
+    const revision = sourceRevision;
+    const offset = await abortable(dispatch('FETCH_PLAYER_CURRENT_TIME_MS_OR_FALLBACK'), options?.signal);
+    throwIfAborted(options?.signal);
+    if (revision !== sourceRevision) throw new DOMException('Source replaced', 'AbortError');
+    commit('SET_OFFSET_MS', offset);
+    await dispatch('CHANGE_PLAYER_SRC', options);
   },
 
   CHANGE_SUBTITLES: async ({ getters, dispatch }) => {
@@ -106,11 +221,23 @@ export default {
     }
   },
 
-  CHANGE_PLAYER_SRC: async ({ getters, commit, dispatch }) => {
+  CHANGE_PLAYER_SRC: async ({ getters, commit, dispatch }, { signal, restorePaused } = {}) => {
+    throwIfAborted(signal);
+    if (!signal || restorePaused === undefined) streamRecovery.cancel();
+    isPlayerStopping = false;
+    sourceRevision += 1;
+    const revision = sourceRevision;
+    const ensureCurrent = () => {
+      throwIfAborted(signal);
+      if (revision !== sourceRevision) throw new DOMException('Source replaced', 'AbortError');
+    };
+    ensureCurrent();
     console.debug('CHANGE_PLAYER_SRC');
+    recordSeekIntent();
 
     // Abort subtitle requests now or else we get ugly errors from the server closing it.
     await dispatch('DESTROY_ASS');
+    ensureCurrent();
 
     if (getters.GET_FORCE_TRANSCODE_RETRY) {
       commit('SET_FORCE_TRANSCODE_RETRY', false);
@@ -124,9 +251,12 @@ export default {
 
     try {
       try {
-        await dispatch('SEND_PLEX_DECISION_REQUEST');
-        await dispatch('LOAD_PLAYER_SRC');
+        await abortable(dispatch('SEND_PLEX_DECISION_REQUEST', { signal, ensureCurrent }), signal);
+        ensureCurrent();
+        await abortable(dispatch('LOAD_PLAYER_SRC', { signal, ensureCurrent, restorePaused }), signal);
+        ensureCurrent();
       } catch (e) {
+        ensureCurrent();
         if (getters.GET_FORCE_TRANSCODE) {
           throw e;
         }
@@ -134,19 +264,32 @@ export default {
 
         // Try again with forced transcoding
         commit('SET_FORCE_TRANSCODE_RETRY', true);
-        await dispatch('SEND_PLEX_DECISION_REQUEST');
-        await dispatch('LOAD_PLAYER_SRC');
+        await abortable(dispatch('SEND_PLEX_DECISION_REQUEST', { signal, ensureCurrent }), signal);
+        ensureCurrent();
+        await abortable(dispatch('LOAD_PLAYER_SRC', { signal, ensureCurrent, restorePaused }), signal);
+        ensureCurrent();
       }
 
       await dispatch('CHANGE_SUBTITLES');
+      ensureCurrent();
 
       // TODO: potentially avoid sending updates on media change since we already do that
       if (getters.GET_MASK_PLAYER_STATE) {
         commit('SET_MASK_PLAYER_STATE', false);
       }
     } finally {
-      commit('SET_IS_CHANGING_SOURCE', false);
+      if (signal?.aborted && revision === sourceRevision) {
+        try {
+          await unload();
+        } catch (error) {
+          console.warn('Cancelled source cleanup failed', error);
+        }
+      }
+      if (revision === sourceRevision) commit('SET_IS_CHANGING_SOURCE', false);
     }
+    ensureCurrent();
+    // Publish readiness only after cancellation cleanup can no longer unload this source.
+    await dispatch('REFRESH_PLAYER_STATE');
   },
 
   SEND_PLEX_TIMELINE_UPDATE: async (
@@ -207,14 +350,44 @@ export default {
     }
   },
 
-  HANDLE_PLAYER_BUFFERING: async ({ getters, dispatch }, event) => {
+  HANDLE_PLAYER_BUFFERING: async ({
+    state, getters, rootGetters, commit, dispatch,
+  }, event) => {
     if (getters.GET_PLAYER_STATE === 'stopped') {
       return;
     }
     console.debug('HANDLE_PLAYER_BUFFERING:', event.buffering ? 'started' : 'ended');
     if (event.buffering) {
+      if (bufferingStartedAt == null) {
+        bufferingStartedAt = Date.now();
+        bufferingEpisode += 1;
+        dispatch('REPORT_PLAYBACK_DIAGNOSTIC', {
+          event: 'buffering-start',
+          details: { episode: bufferingEpisode },
+        });
+      }
       await dispatch('CHANGE_PLAYER_STATE', 'buffering');
     } else {
+      const startedAt = bufferingStartedAt;
+      bufferingStartedAt = null;
+      if (startedAt != null) {
+        const snapshot = getPlaybackDiagnostics();
+        if (!state.isChangingSource && !state.syncSeekTarget && !snapshot.seeking && !snapshot.isCasting) {
+          commit('RECORD_BUFFERING_EPISODE', { at: Date.now(), durationMs: Date.now() - startedAt });
+          commit('SET_QUALITY_RECOMMENDATION', recommendLowerQuality({
+            episodes: state.bufferingHistory,
+            now: Date.now(),
+            currentLimit: rootGetters['settings/GET_SLPLAYERQUALITY'],
+            streamBitrate: snapshot.shaka?.streamBandwidth
+              || (getters.GET_STREAMS?.find((stream) => stream.streamType === 1)?.bitrate || 0) * 1000,
+            bufferAhead: snapshot.bufferAhead,
+          }));
+        }
+        dispatch('REPORT_PLAYBACK_DIAGNOSTIC', {
+          event: 'buffering-end',
+          details: { episode: bufferingEpisode, durationMs: Date.now() - startedAt },
+        });
+      }
       // Report back if player is playing
       await dispatch('CHANGE_PLAYER_STATE', isPaused() ? 'paused' : 'playing');
     }
@@ -238,11 +411,17 @@ export default {
     await dispatch('DESTROY_ASS');
   },
 
-  HANDLE_SEEKED: async ({ state, dispatch }) => {
+  HANDLE_SEEKED: async ({ state, commit, dispatch }) => {
     if (state.isChangingSource) {
       return;
     }
     console.debug('HANDLE_SEEKED');
+    const userInitiatedSeek = consumeUserSeekIntent();
+    commit('SET_SYNC_SEEK_TARGET', null);
+    await dispatch('synclounge/PROCESS_PLAYER_STATE_UPDATE', {
+      noSync: true,
+      userInitiatedSeek,
+    }, { root: true });
     await dispatch('CHANGE_SUBTITLES');
   },
 
@@ -313,9 +492,27 @@ export default {
   },
 
   HANDLE_ERROR: ({ dispatch }, e) => {
-    console.error('HANDLE_ERROR: player error, restarting source:', e.detail || e);
-    // Restart source
-    return dispatch('UPDATE_PLAYER_SRC_AND_KEEP_TIME');
+    if (isPlayerStopping) return Promise.resolve('cancelled');
+    dispatch('REPORT_PLAYBACK_DIAGNOSTIC', {
+      event: 'player-error', details: summarizePlayerError(e),
+    });
+    const restorePaused = Boolean(isPaused());
+    return streamRecovery.run(async (signal, attempt) => {
+      await dispatch('REPORT_PLAYBACK_DIAGNOSTIC', {
+        event: 'stream-recovery-start', details: { attempt },
+      });
+      throwIfAborted(signal);
+      await dispatch('UPDATE_PLAYER_SRC_AND_KEEP_TIME', { signal, restorePaused });
+      throwIfAborted(signal);
+      await dispatch('REPORT_PLAYBACK_DIAGNOSTIC', { event: 'stream-recovery-complete' });
+    }, async (signal) => {
+      await dispatch('REPORT_PLAYBACK_DIAGNOSTIC', { event: 'stream-recovery-exhausted' });
+      throwIfAborted(signal);
+      await dispatch('DISPLAY_NOTIFICATION', {
+        text: 'Playback could not recover. Check your connection, then reopen the movie to retry.',
+        color: 'error',
+      }, { root: true });
+    });
   },
 
   PRESS_PLAY: async ({ commit }) => {
@@ -356,6 +553,10 @@ export default {
   },
 
   PRESS_STOP: async ({ getters, commit, dispatch }) => {
+    isPlayerStopping = true;
+    streamRecovery.cancel();
+    sourceRevision += 1;
+    await dispatch('plexclients/CANCEL_PLAY_MEDIA', null, { root: true });
     const mediaElement = getMediaElement();
     if (getters.IS_AUTOPLAY_BLOCKED && mediaElement) {
       mediaElement.muted = false;
@@ -365,11 +566,13 @@ export default {
   },
 
   SOFT_SEEK: ({ commit }, seekToMs) => {
+    if (hasPendingUserSeek()) return;
     console.debug('SOFT_SEEK', seekToMs);
     if (!isTimeInBufferedRange(seekToMs)) {
       throw new Error('Soft seek not allowed outside of buffered range');
     }
 
+    commit('SET_SYNC_SEEK_TARGET', seekToMs);
     commit('SET_OFFSET_MS', seekToMs);
     setCurrentTimeMs(seekToMs);
   },
@@ -418,7 +621,9 @@ export default {
   },
 
   NORMAL_SEEK: async ({ rootGetters, commit }, { cancelSignal, seekToMs }) => {
+    if (hasPendingUserSeek()) return;
     console.debug('NORMAL_SEEK', seekToMs);
+    commit('SET_SYNC_SEEK_TARGET', seekToMs);
     commit('SET_OFFSET_MS', seekToMs);
 
     const timeoutToken = CAF.timeout(
@@ -484,6 +689,7 @@ export default {
 
         try {
           yield dispatch('SEND_PLEX_TIMELINE_UPDATE', { signal });
+          yield dispatch('REPORT_PLAYBACK_DIAGNOSTIC', { event: 'playback-health' });
         } catch (e) {
           console.error(e);
         }
@@ -514,20 +720,45 @@ export default {
     await plexTimelineUpdatePromise;
   },
 
-  LOAD_PLAYER_SRC: async ({ getters }) => {
+  LOAD_PLAYER_SRC: async ({ getters, commit, dispatch }, {
+    signal, ensureCurrent = () => {}, restorePaused,
+  } = {}) => {
+    const url = getters.GET_SRC_URL;
+    const offset = getters.GET_OFFSET_MS;
     // TODO: potentailly unload if already loaded to avoid load interrupted errors
     // However, while its loading, potentially   reporting the old time...
-    console.debug('LOAD_PLAYER_SRC:', getters.GET_SRC_URL);
+    bufferingStartedAt = null;
+    commit('CLEAR_QUALITY_RECOVERY');
+    console.debug('LOAD_PLAYER_SRC: loading');
+    const mediaElement = getMediaElement();
+    if (mediaElement) mediaElement.autoplay = restorePaused !== true;
     await unload();
-    await load(getters.GET_SRC_URL);
+    throwIfAborted(signal);
+    ensureCurrent();
+    await abortable(load(url), signal);
+    throwIfAborted(signal);
+    ensureCurrent();
     console.debug('LOAD_PLAYER_SRC: loaded, offset:', getters.GET_OFFSET_MS);
+    dispatch('REPORT_PLAYBACK_DIAGNOSTIC', { event: 'playback-loaded' });
 
-    if (getters.GET_OFFSET_MS > 0) {
-      setCurrentTimeMs(getters.GET_OFFSET_MS);
+    if (offset > 0) {
+      commit('SET_SYNC_SEEK_TARGET', offset);
+      setCurrentTimeMs(offset);
     }
+    // Casting leaves the local video idle; readiness is handled by the receiver.
+    if (restorePaused !== undefined && !isCasting()) await waitForVideoReady(mediaElement, signal);
+    throwIfAborted(signal);
+    ensureCurrent();
+    if (restorePaused === true) pause();
+    else if (restorePaused === false) await dispatch('PRESS_PLAY');
+    throwIfAborted(signal);
+    ensureCurrent();
   },
 
-  NAVIGATE_AND_INITIALIZE_PLAYER: ({ commit }) => {
+  NAVIGATE_AND_INITIALIZE_PLAYER: ({ getters, commit }) => {
+    if (getters.GET_PLAYER_INITIALIZED_DEFERRED_PROMISE) {
+      return getters.GET_PLAYER_INITIALIZED_DEFERRED_PROMISE.promise;
+    }
     console.debug('NAVIGATE_AND_INITIALIZE_PLAYER');
     // I don't really like this. I'd rather have the player be part of the main app rather than a
     // vue route
@@ -554,7 +785,9 @@ export default {
       await dispatch('START_UPDATE_PLAYER_CONTROLS_SHOWN_INTERVAL');
       setVolume(rootGetters['settings/GET_SLPLAYERVOLUME']);
 
-      if (rootGetters['plexclients/GET_ACTIVE_MEDIA_METADATA']
+      // PLAY_MEDIA owns source loading when navigation has a waiting caller.
+      if (!getters.GET_PLAYER_INITIALIZED_DEFERRED_PROMISE
+        && rootGetters['plexclients/GET_ACTIVE_MEDIA_METADATA']
         && rootGetters['plexclients/GET_ACTIVE_SERVER_ID']) {
         await dispatch('CHANGE_PLAYER_SRC');
         const shouldPlayOnLoad = getters.GET_SHOULD_PLAY_ON_LOAD
@@ -580,11 +813,29 @@ export default {
         text: 'Failed to load media. If you have another tab playing, please close it and try again.',
         color: 'error',
       }, { root: true });
+      await dispatch('ROLLBACK_PLAYER_INITIALIZATION');
       if (getters.GET_PLAYER_INITIALIZED_DEFERRED_PROMISE) {
         getters.GET_PLAYER_INITIALIZED_DEFERRED_PROMISE.reject(e);
         commit('SET_PLAYER_INITIALIZED_DEFERRED_PROMISE', null);
       }
+      throw e;
     }
+  },
+
+  ROLLBACK_PLAYER_INITIALIZATION: async ({ getters, commit, dispatch }) => {
+    getters.GET_PLAYER_DESTROY_CANCEL_TOKEN?.abort();
+    commit('SET_PLAYER_DESTROY_CANCEL_TOKEN', null);
+    commit('STOP_UPDATE_PLAYER_CONTROLS_SHOWN_INTERVAL');
+
+    await Promise.allSettled([
+      Promise.resolve().then(() => dispatch('UNREGISTER_PLAYER_EVENTS')),
+      Promise.resolve().then(() => dispatch('CANCEL_PERIODIC_PLEX_TIMELINE_UPDATE')),
+      Promise.resolve().then(() => dispatch('DESTROY_SUBTITLES')),
+      Promise.resolve().then(() => destroy()),
+    ]);
+
+    commit('SET_IS_PLAYER_INITIALIZED', false);
+    commit('SET_AUTOPLAY_BLOCKED', false);
   },
 
   CANCEL_PERIODIC_PLEX_TIMELINE_UPDATE: ({ getters, commit }) => {
@@ -595,9 +846,16 @@ export default {
   },
 
   DESTROY_PLAYER_STATE: async ({ getters, commit, dispatch }) => {
+    isPlayerStopping = true;
+    streamRecovery.cancel();
+    sourceRevision += 1;
     console.debug('DESTROY_PLAYER_STATE');
+    recordSeekIntent();
+    bufferingStartedAt = null;
+    bufferingEpisode = 0;
+    lastHealthDiagnosticAt = 0;
     commit('CLEAR_CAST_SYNC_INTERVAL');
-    getters.GET_PLAYER_DESTROY_CANCEL_TOKEN.abort();
+    getters.GET_PLAYER_DESTROY_CANCEL_TOKEN?.abort();
     commit('SET_PLAYER_DESTROY_CANCEL_TOKEN', null);
     commit('SET_FORCE_TRANSCODE_RETRY', false);
 
@@ -620,6 +878,7 @@ export default {
     commit('SET_SUBTITLE_OFFSET', 0);
     await destroy();
     commit('SET_OFFSET_MS', 0);
+    commit('SET_SYNC_SEEK_TARGET', null);
   },
 
   REGISTER_PLAYER_EVENTS: ({ commit, dispatch }) => {
@@ -642,17 +901,25 @@ export default {
   },
 
   UNREGISTER_PLAYER_EVENTS: ({ state, getters, commit }) => {
-    removeEventListener('buffering', getters.GET_BUFFERING_EVENT_LISTENER);
+    if (getters.GET_BUFFERING_EVENT_LISTENER) {
+      removeEventListener('buffering', getters.GET_BUFFERING_EVENT_LISTENER);
+    }
     commit('SET_BUFFERING_EVENT_LISTENER', null);
 
-    getSmallPlayButton().removeEventListener('click', getters.GET_CLICK_EVENT_LISTENER);
-    getBigPlayButton().removeEventListener('click', getters.GET_CLICK_EVENT_LISTENER);
+    if (getters.GET_CLICK_EVENT_LISTENER) {
+      getSmallPlayButton().removeEventListener('click', getters.GET_CLICK_EVENT_LISTENER);
+      getBigPlayButton().removeEventListener('click', getters.GET_CLICK_EVENT_LISTENER);
+    }
     commit('SET_CLICK_EVENT_LISTENER', null);
 
-    removeEventListener('error', getters.GET_ERROR_EVENT_LISTENER);
+    if (getters.GET_ERROR_EVENT_LISTENER) {
+      removeEventListener('error', getters.GET_ERROR_EVENT_LISTENER);
+    }
     commit('SET_ERROR_EVENT_LISTENER', null);
 
-    removeCastStatusListener(state.castStatusListener);
+    if (state.castStatusListener) {
+      removeCastStatusListener(state.castStatusListener);
+    }
     commit('SET_CAST_STATUS_LISTENER', null);
   },
 
@@ -742,7 +1009,7 @@ export default {
     await dispatch('plexclients/UPDATE_ACTIVE_PLAY_QUEUE', null, { root: true });
   },
 
-  SKIP_INTRO: async ({ dispatch, commit, rootGetters }) => {
+  SKIP_INTRO: async ({ dispatch, commit, rootGetters }, { userInitiated = true } = {}) => {
     const introMarker = rootGetters['plexclients/GET_ACTIVE_MEDIA_METADATA_INTRO_MARKER'];
     if (!introMarker) {
       return;
@@ -755,7 +1022,7 @@ export default {
     }, { root: true });
 
     commit('SET_OFFSET_MS', introEnd);
-    setCurrentTimeMs(introEnd);
+    setCurrentTimeMs(introEnd, { userInitiated });
   },
 
   ...subtitleActions,

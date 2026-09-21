@@ -1,22 +1,32 @@
 <template>
-  <v-container class="fill-height">
+  <v-container class="welcome-layout">
     <v-row
       align="center"
       justify="center"
     >
       <v-col>
         <v-card
-          class="mx-auto"
-          max-width="550"
+          class="mx-auto welcome-card"
+          max-width="480"
           :loading="loading"
-          variant="outlined"
-          color="rgba(255, 255, 255, 0.12)"
+          variant="flat"
         >
-          <v-card-title>
-            <v-img
+          <div class="welcome-heading">
+            <img
               src="@/assets/images/logos/logo-long-light.png"
-            />
-          </v-card-title>
+              alt="SyncLounge"
+              class="welcome-logo"
+            >
+            <p class="eyebrow">
+              YOUR NEXT MOVIE NIGHT
+            </p>
+            <h1 class="welcome-title">
+              Start a watch party.
+            </h1>
+            <p class="welcome-description">
+              Create a room, pick something to watch, and invite your friends with a link.
+            </p>
+          </div>
 
           <v-alert
             v-if="error"
@@ -46,25 +56,18 @@
             </v-row>
           </v-alert>
 
-          <v-card-actions class="mt-2 justify-center flex-column ga-2">
+          <v-card-actions class="welcome-actions justify-center flex-column ga-3">
             <v-btn
               variant="flat"
               color="primary"
-              class="text-white"
+              class="welcome-primary"
+              size="large"
               block
               :disabled="!GET_SERVERS_HEALTH || Object.keys(GET_SERVERS_HEALTH).length === 0
                 || loading"
               @click="createRoom"
             >
-              Connect
-            </v-btn>
-
-            <v-btn
-              variant="outlined"
-              color="primary"
-              :to="{ name: 'AdvancedRoomJoin' }"
-            >
-              Advanced
+              Create a room
             </v-btn>
           </v-card-actions>
         </v-card>
@@ -126,6 +129,7 @@ export default {
     },
 
     async createRoom() {
+      this.$store.commit('SET_RIGHT_SIDEBAR_OPEN', false);
       this.error = null;
       this.loading = true;
 
@@ -139,11 +143,12 @@ export default {
           this.$router.push(this.linkWithRoom({ name: 'PlexHome' }));
         }
       } catch (e) {
-        this.DISCONNECT_IF_CONNECTED();
-        console.error(e);
-
-        this.error = mapErrorMessage(e);
-        await this.fetchServersHealth();
+        if (e.name !== 'AbortError') {
+          await this.DISCONNECT_IF_CONNECTED();
+          console.error(e);
+          this.error = mapErrorMessage(e);
+          await this.fetchServersHealth();
+        }
       }
 
       this.loading = false;
