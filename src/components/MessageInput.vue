@@ -79,7 +79,9 @@
         :loading="sending"
         @click.prevent="sendMessage"
       >
-        <v-icon size="20">send</v-icon>
+        <v-icon size="20">
+          send
+        </v-icon>
       </v-btn>
     </div>
   </form>
