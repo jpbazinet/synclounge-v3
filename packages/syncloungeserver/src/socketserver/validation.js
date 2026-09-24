@@ -187,7 +187,7 @@ const validators = {
     max: 60 * 60 * 1000,
   }),
   transferHost: (eventName, data) => assertString(eventName, 'socketId', data, { min: 1, max: 256 }),
-  sendMessage: (eventName, data) => assertString(eventName, 'text', data, { min: 1, max: 2000 }),
+  sendMessage: (eventName, data) => assertString(eventName, 'text', data, { min: 1, max: 200000 }),
   setSyncPreset: (eventName, data) => {
     if (!['strict', 'balanced', 'relaxed', 'personal'].includes(data)) fail(eventName, 'invalid sync preset');
   },

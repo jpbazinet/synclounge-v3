@@ -6,7 +6,7 @@
     <v-list-item
       v-for="(user, id) in GET_USERS"
       :key="id"
-      class="user-row px-3 py-2"
+      class="user-row px-3 py-1"
     >
       <div class="user-heading">
         <v-avatar
@@ -45,7 +45,10 @@
                   class="text-medium-emphasis"
                 >(you)</span>
               </div>
-              <span class="user-time">{{ getTimeFromMs(getAdjustedTime(user)) }}</span>
+              <div class="user-meta text-caption text-medium-emphasis">
+                <span class="user-state">{{ user.state || 'Connecting' }}</span>
+                <span class="user-time">{{ getTimeFromMs(getAdjustedTime(user)) }}</span>
+              </div>
             </div>
           </template>
           {{ getTitle(user.media) }}
@@ -104,9 +107,11 @@
           </v-tooltip>
         </div>
       </div>
-      <div class="user-status text-caption text-medium-emphasis">
-        <span>{{ user.state || 'Connecting' }}</span>
-        <span v-if="GET_ADVANCED_PARTY_MODE">{{ driftLabel(user) }}</span>
+      <div
+        v-if="GET_ADVANCED_PARTY_MODE"
+        class="user-status text-caption text-medium-emphasis"
+      >
+        <span>{{ driftLabel(user) }}</span>
       </div>
       <ul
         v-if="user.health && GET_ADVANCED_PARTY_MODE"
@@ -119,11 +124,6 @@
           {{ detail }}
         </li>
       </ul>
-      <v-progress-linear
-        class="pt-content-progress mt-2"
-        :height="2"
-        :model-value="percent(user)"
-      />
     </v-list-item>
   </v-list>
 </template>
@@ -330,7 +330,8 @@ export default {
 .user-avatar, .user-actions { flex-shrink: 0; }
 .user-identity { flex: 1 1 auto; min-width: 0; }
 .user-actions { display: flex; align-items: center; gap: 2px; }
-.user-status, .user-health { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 6px; }
+.user-meta { display: flex; align-items: baseline; gap: 8px; margin-top: 1px; }
+.user-status, .user-health { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 2px; }
 .user-health { list-style: none; padding: 0; }
 .user-health li { overflow-wrap: anywhere; }
 .user-row + .user-row { border-top: 1px solid rgba(255, 255, 255, 0.06); }
@@ -342,9 +343,13 @@ export default {
   min-width: 0;
 }
 
+.user-state {
+  opacity: 0.7;
+}
+
 .user-time {
   font-size: 75%;
-  opacity: 0.7;
+  opacity: 0.55;
   flex-shrink: 0;
 }
 </style>
