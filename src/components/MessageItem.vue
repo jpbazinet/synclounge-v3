@@ -1,5 +1,7 @@
 <template>
-  <v-list-item class="message-item">
+  <v-list-item
+    class="message-item"
+  >
     <template #prepend>
       <v-avatar size="32" class="message-avatar">
         <v-img :src="sender.thumb" />
@@ -13,7 +15,10 @@
     </v-list-item-title>
     <v-list-item-subtitle>
       <!-- eslint-disable-next-line vue/no-v-html -->
-      <div class="message-content" v-html="processedText" />
+      <div
+        class="message-content"
+        v-html="processedText"
+      />
     </v-list-item-subtitle>
   </v-list-item>
 </template>
