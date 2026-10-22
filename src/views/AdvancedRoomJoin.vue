@@ -29,7 +29,7 @@
             </p>
           </div>
 
-          <v-card-text class="pt-2">
+          <v-card-text class="pt-2 welcome-body">
             <h2 class="section-header">
               Available watch-party services
             </h2>
@@ -83,8 +83,14 @@
                       v-else
                       class="text-center text-red"
                     >
-                      Unavailable
+                      {{ healthChecking ? 'Checking availability…' : 'Unavailable' }}
                     </div>
+                    <p
+                      v-if="!GET_SERVER_HEALTH(server.url) && !healthChecking"
+                      class="text-caption mt-2"
+                    >
+                      This service did not respond. Retry the availability check or choose another service.
+                    </p>
                   </v-card-text>
 
                   <v-card-actions class="px-4 pb-4">
@@ -93,7 +99,8 @@
                       variant="flat"
                       color="primary"
                       class="welcome-primary"
-                      :disabled="connectionPending"
+                      :disabled="connectionPending || !GET_SERVER_HEALTH(server.url)"
+                      :aria-label="`Connect to ${server.name}`"
                       @click="connect(server.url)"
                     >
                       Connect
@@ -124,7 +131,10 @@
 
                   <v-card-text>
                     <v-text-field
-                      hide-details
+                      hide-details="auto"
+                      :error-messages="customServerTouched ? customServerError : ''"
+                      hint="Use a complete http:// or https:// address."
+                      persistent-hint
                       variant="outlined"
                       density="compact"
                       label="SyncLounge service address"
@@ -133,6 +143,7 @@
                       placeholder="https://"
                       :model-value="customServerUrl"
                       @update:model-value="SET_CUSTOM_SERVER_URL"
+                      @blur="customServerTouched = true"
                     />
                   </v-card-text>
 
@@ -142,8 +153,9 @@
                       variant="flat"
                       color="primary"
                       class="welcome-primary"
-                      :disabled="connectionPending"
-                      @click="connect(customServerUrl)"
+                      :disabled="connectionPending || !!customServerError"
+                      aria-label="Connect to custom SyncLounge service"
+                      @click="connect(customServerUrl, true)"
                     >
                       Connect
                     </v-btn>
@@ -151,6 +163,15 @@
                 </v-card>
               </v-col>
             </v-row>
+
+            <v-btn
+              class="mt-4"
+              :loading="healthChecking"
+              :disabled="connectionPending"
+              @click="refreshHealth"
+            >
+              Retry availability check
+            </v-btn>
 
             <v-row
               v-if="connectionPending && !serverError"
@@ -175,7 +196,7 @@
             </v-alert>
           </v-card-text>
 
-          <v-card-actions class="justify-center pb-4">
+          <v-card-actions class="welcome-actions justify-center">
             <v-btn
               variant="text"
               :to="{ name: 'RoomCreation' }"
@@ -206,11 +227,26 @@ export default {
 
   data: () => ({
     serverError: null,
+    customServerTouched: false,
+    healthChecking: true,
+    healthRequestPending: false,
     connectionPending: false,
     testConnectionInterval: null,
   }),
 
   computed: {
+    customServerError() {
+      try {
+        const address = new URL(this.customServerUrl.trim());
+        if (!['http:', 'https:'].includes(address.protocol) || !address.hostname
+          || address.username || address.password || address.search || address.hash) {
+          return 'Enter an http:// or https:// service address without credentials, query, or fragment.';
+        }
+        return '';
+      } catch {
+        return 'Enter a complete address, such as https://lounge.example.com.';
+      }
+    },
     ...mapGetters([
       'GET_CONFIG',
     ]),
@@ -228,16 +264,29 @@ export default {
     clearInterval(this.testConnectionInterval);
   },
 
-  async created() {
-    await this.FETCH_SERVERS_HEALTH();
+  created() {
+    this.refreshHealth();
 
     this.testConnectionInterval = setInterval(
-      () => this.FETCH_SERVERS_HEALTH(),
+      () => this.refreshHealth(),
       5000,
     );
   },
 
   methods: {
+    async refreshHealth() {
+      if (this.healthRequestPending) return;
+      this.healthRequestPending = true;
+      this.healthChecking = true;
+      try {
+        await this.FETCH_SERVERS_HEALTH();
+      } catch {
+        this.serverError = 'Couldn’t check service availability. Try again.';
+      } finally {
+        this.healthChecking = false;
+        this.healthRequestPending = false;
+      }
+    },
     ...mapMutations('settings', [
       'SET_CUSTOM_SERVER_URL',
     ]),
@@ -274,13 +323,17 @@ export default {
       return ['text-white'];
     },
 
-    async connect(server) {
+    async connect(server, custom = false) {
+      if (this.connectionPending) return;
+      if (server === this.customServerUrl && this.customServerError) return;
+      if (!custom && this.GET_CONFIG.servers.some((configured) => configured.url === server)
+        && !this.GET_SERVER_HEALTH(server)) return;
       this.serverError = null;
       this.connectionPending = true;
 
       try {
         await this.SET_AND_CONNECT_AND_JOIN_ROOM({
-          server,
+          server: server.trim(),
           room: getRandomRoomId(),
         });
 
@@ -314,6 +367,8 @@ export default {
   letter-spacing: 0.08em;
 }
 
+.server-card :deep(.v-card-title) { white-space: normal; overflow-wrap: anywhere; line-height: 1.35; }
+
 .server-card {
   border: 1px solid rgba(255, 255, 255, 0.1);
   height: 100%;
@@ -324,4 +379,6 @@ export default {
 .server-card :deep(.v-card-text) {
   flex: 1;
 }
+
+.server-card :deep(.v-img) { flex: 0 0 140px; height: 140px; }
 </style>

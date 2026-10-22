@@ -1,8 +1,12 @@
 import { CAF } from 'caf';
+import { markRaw } from 'vue';
 import createStreamRecovery, { waitForVideoReady } from '@/utils/streamrecovery';
 import recommendLowerQuality from '@/utils/qualityrecovery';
 import { rememberDiagnostic } from '@/utils/problemreport';
-import { consumeUserSeekIntent, hasPendingUserSeek, recordSeekIntent } from '@/player/seekIntent';
+import {
+  consumeUserSeekIntent, hasPendingUserSeek, recordSeekIntent, getUserSeekRevision,
+} from '@/player/seekIntent';
+import isSeekLandingValid from '@/utils/seeklanding';
 import { abortable, throwIfAborted } from '@/utils/cancellation';
 
 import { getRandomPlexId } from '@/utils/random';
@@ -24,11 +28,15 @@ import subtitleActions from './subtitleActions';
 // Module-level guard for play queue transitions (not reactive, so reads are synchronous)
 let isPlayQueueTransitioning = false;
 let sourceRevision = 0;
+let automaticSeekRevision = 0;
+let seekRebaseRevision = null;
+let blockedSeekRevision = null;
 let isPlayerStopping = false;
 const streamRecovery = createStreamRecovery();
 let bufferingStartedAt = null;
 let bufferingEpisode = 0;
 let lastHealthDiagnosticAt = 0;
+let pendingPlexTimelineUpdate = null;
 
 const HEALTH_DIAGNOSTIC_INTERVAL_MS = 60 * 1000;
 
@@ -48,6 +56,13 @@ const summarizeStream = (stream) => (stream ? Object.fromEntries([
   'decision',
   'selected',
 ].filter((key) => stream[key] !== undefined).map((key) => [key, stream[key]])) : null);
+
+const rejectPendingInitialization = ({ getters, commit }, error) => {
+  const deferred = getters.GET_PLAYER_INITIALIZED_DEFERRED_PROMISE;
+  deferred?.removeAbortListener?.();
+  commit('SET_PLAYER_INITIALIZED_DEFERRED_PROMISE', null);
+  deferred?.reject(error);
+};
 
 export default {
   REPORT_PLAYBACK_DIAGNOSTIC: ({ state, getters, rootGetters }, {
@@ -111,7 +126,12 @@ export default {
           transcodeCode: getters.GET_PLEX_DECISION?.MediaContainer?.transcodeDecisionCode,
         },
       },
-      playback: getPlaybackDiagnostics(),
+      playback: {
+        ...getPlaybackDiagnostics(),
+        reportedState: getters.GET_PLAYER_STATE,
+        sourceChanging: state.isChangingSource,
+        stateMasked: getters.GET_MASK_PLAYER_STATE,
+      },
       details,
     };
     rememberDiagnostic(diagnostic);
@@ -208,26 +228,29 @@ export default {
     await dispatch('CHANGE_PLAYER_SRC', options);
   },
 
-  CHANGE_SUBTITLES: async ({ getters, dispatch }) => {
+  CHANGE_SUBTITLES: async ({ getters, dispatch }, options) => {
     console.debug('CHANGE_SUBTITLES:', {
       isUsingNative: getters.IS_USING_NATIVE_SUBTITLES,
       subtitleStreamId: getters.GET_SUBTITLE_STREAM_ID,
       canDirectPlaySubs: getters.CAN_DIRECT_PLAY_SUBTITLES,
     });
     if (getters.IS_USING_NATIVE_SUBTITLES) {
-      await dispatch('SET_SUBTITLE_URL');
+      await dispatch('SET_SUBTITLE_URL', options);
     } else {
       await dispatch('DESTROY_ASS');
     }
   },
 
-  CHANGE_PLAYER_SRC: async ({ getters, commit, dispatch }, { signal, restorePaused } = {}) => {
+  CHANGE_PLAYER_SRC: async ({ getters, commit, dispatch }, {
+    signal, restorePaused, ensureOwner = () => {},
+  } = {}) => {
     throwIfAborted(signal);
     if (!signal || restorePaused === undefined) streamRecovery.cancel();
     isPlayerStopping = false;
     sourceRevision += 1;
     const revision = sourceRevision;
     const ensureCurrent = () => {
+      ensureOwner();
       throwIfAborted(signal);
       if (revision !== sourceRevision) throw new DOMException('Source replaced', 'AbortError');
     };
@@ -235,9 +258,10 @@ export default {
     console.debug('CHANGE_PLAYER_SRC');
     recordSeekIntent();
 
-    // Abort subtitle requests now or else we get ugly errors from the server closing it.
-    await dispatch('DESTROY_ASS');
-    ensureCurrent();
+    const previousSession = getters.GET_X_PLEX_SESSION_ID;
+    let loadStarted = false;
+    let subtitlesDestroyed = false;
+    const onLoadStart = () => { ensureCurrent(); loadStarted = true; };
 
     if (getters.GET_FORCE_TRANSCODE_RETRY) {
       commit('SET_FORCE_TRANSCODE_RETRY', false);
@@ -245,15 +269,20 @@ export default {
 
     commit('SET_SESSION', getRandomPlexId());
 
-    // Suppress seeking/seeked event handlers during source change to prevent them
-    // from aborting the subtitle fetch that CHANGE_SUBTITLES starts below.
+    // Suppress intermediate player events until the replacement stream has loaded.
     commit('SET_IS_CHANGING_SOURCE', true);
 
     try {
+      // Keep teardown inside the same ownership cleanup as decision/load.
+      await dispatch('DESTROY_ASS');
+      subtitlesDestroyed = true;
+      ensureCurrent();
       try {
         await abortable(dispatch('SEND_PLEX_DECISION_REQUEST', { signal, ensureCurrent }), signal);
         ensureCurrent();
-        await abortable(dispatch('LOAD_PLAYER_SRC', { signal, ensureCurrent, restorePaused }), signal);
+        await abortable(dispatch('LOAD_PLAYER_SRC', {
+          signal, ensureCurrent, restorePaused, onLoadStart,
+        }), signal);
         ensureCurrent();
       } catch (e) {
         ensureCurrent();
@@ -266,28 +295,53 @@ export default {
         commit('SET_FORCE_TRANSCODE_RETRY', true);
         await abortable(dispatch('SEND_PLEX_DECISION_REQUEST', { signal, ensureCurrent }), signal);
         ensureCurrent();
-        await abortable(dispatch('LOAD_PLAYER_SRC', { signal, ensureCurrent, restorePaused }), signal);
+        await abortable(dispatch('LOAD_PLAYER_SRC', {
+          signal, ensureCurrent, restorePaused, onLoadStart,
+        }), signal);
         ensureCurrent();
       }
-
-      await dispatch('CHANGE_SUBTITLES');
-      ensureCurrent();
 
       // TODO: potentially avoid sending updates on media change since we already do that
       if (getters.GET_MASK_PLAYER_STATE) {
         commit('SET_MASK_PLAYER_STATE', false);
       }
     } finally {
-      if (signal?.aborted && revision === sourceRevision) {
-        try {
-          await unload();
-        } catch (error) {
-          console.warn('Cancelled source cleanup failed', error);
+      let ownerCancelled = false;
+      try { ensureOwner(); } catch { ownerCancelled = true; }
+      if ((signal?.aborted || ownerCancelled) && revision === sourceRevision) {
+        dispatch('REPORT_PLAYBACK_DIAGNOSTIC', { event: 'source-startup-cancelled' });
+        if (loadStarted) {
+          try {
+            await unload();
+          } catch (error) {
+            console.warn('Cancelled source cleanup failed', error);
+          }
+        } else {
+          // The old stream is intact; keep its Plex session and subtitle renderer.
+          commit('SET_SESSION', previousSession);
+          if (subtitlesDestroyed) {
+            const ensureRestorationCurrent = () => {
+              if (revision !== sourceRevision) throw new DOMException('Source replaced', 'AbortError');
+            };
+            Promise.resolve(dispatch('CHANGE_SUBTITLES', { ensureCurrent: ensureRestorationCurrent }))
+              .catch(() => {});
+          }
         }
       }
       if (revision === sourceRevision) commit('SET_IS_CHANGING_SOURCE', false);
     }
     ensureCurrent();
+    // Subtitle streams can remain pending while video is already playing. They must
+    // not mask the room timeline or prevent callers from restarting periodic reports.
+    // Each subtitle task guards its renderer writes against source replacement/stop.
+    Promise.resolve(dispatch('CHANGE_SUBTITLES', { ensureCurrent })).catch((error) => {
+      if (error?.name === 'AbortError' || revision !== sourceRevision) return;
+      dispatch('REPORT_PLAYBACK_DIAGNOSTIC', { event: 'subtitle-load-failed' });
+      dispatch('DISPLAY_NOTIFICATION', {
+        text: 'Subtitles could not be loaded. Try selecting the subtitle track again.',
+        color: 'warning',
+      }, { root: true });
+    });
     // Publish readiness only after cancellation cleanup can no longer unload this source.
     await dispatch('REFRESH_PLAYER_STATE');
   },
@@ -556,7 +610,14 @@ export default {
     isPlayerStopping = true;
     streamRecovery.cancel();
     sourceRevision += 1;
-    await dispatch('plexclients/CANCEL_PLAY_MEDIA', null, { root: true });
+    const cancelledStartup = await dispatch('plexclients/CANCEL_PLAY_MEDIA', null, { root: true });
+    if (getters.IS_PLAYER_INITIALIZED === false) {
+      commit('SET_PLAYER_STATE', 'stopped');
+      if (cancelledStartup !== true) {
+        await dispatch('synclounge/PUBLISH_CANCELLED_PLAYBACK', null, { root: true });
+      }
+      return;
+    }
     const mediaElement = getMediaElement();
     if (getters.IS_AUTOPLAY_BLOCKED && mediaElement) {
       mediaElement.muted = false;
@@ -567,6 +628,7 @@ export default {
 
   SOFT_SEEK: ({ commit }, seekToMs) => {
     if (hasPendingUserSeek()) return;
+    automaticSeekRevision += 1;
     console.debug('SOFT_SEEK', seekToMs);
     if (!isTimeInBufferedRange(seekToMs)) {
       throw new Error('Soft seek not allowed outside of buffered range');
@@ -620,21 +682,52 @@ export default {
     return main(cancelSignal);
   },
 
-  NORMAL_SEEK: async ({ rootGetters, commit }, { cancelSignal, seekToMs }) => {
-    if (hasPendingUserSeek()) return;
+  NORMAL_SEEK: async ({ rootGetters, commit, dispatch }, { cancelSignal, seekToMs }) => {
+    throwIfAborted(cancelSignal);
+    if (!Number.isFinite(seekToMs) || seekToMs < 0) throw new Error('Invalid seek target');
+    if (hasPendingUserSeek() || blockedSeekRevision === sourceRevision) return;
+    automaticSeekRevision += 1;
+    const operation = automaticSeekRevision;
+    let revision = sourceRevision;
+    const userRevision = getUserSeekRevision();
+    const ensureOwner = () => {
+      throwIfAborted(cancelSignal);
+      if (operation !== automaticSeekRevision || userRevision !== getUserSeekRevision()) {
+        throw new DOMException('Seek replaced', 'AbortError');
+      }
+    };
+    const ensureCurrent = () => {
+      ensureOwner();
+      if (revision !== sourceRevision) throw new DOMException('Source replaced', 'AbortError');
+    };
+    const paused = Boolean(isPaused());
+    const rate = getPlaybackRate() || 1;
+    const startedAt = Date.now();
+    const tolerance = rootGetters.GET_CONFIG.slplayer_seek_settle_tolerance ?? 250;
+    const landed = (target, since) => isSeekLandingValid({
+      target, actual: getCurrentTimeMs(), elapsedMs: Date.now() - since, paused, rate, tolerance,
+    });
+    const blockCorrection = () => {
+      ensureCurrent();
+      blockedSeekRevision = revision;
+      dispatch('REPORT_PLAYBACK_DIAGNOSTIC', { event: 'seek-recovery-blocked' });
+      dispatch('DISPLAY_NOTIFICATION', {
+        text: 'Automatic sync could not reach the requested position. Reload the player to retry.',
+        color: 'warning',
+      }, { root: true });
+    };
     console.debug('NORMAL_SEEK', seekToMs);
     commit('SET_SYNC_SEEK_TARGET', seekToMs);
     commit('SET_OFFSET_MS', seekToMs);
 
+    const seekTimeout = rootGetters.GET_CONFIG.slplayer_seek_timeout ?? 15000;
     const timeoutToken = CAF.timeout(
-      rootGetters.GET_CONFIG.slplayer_seek_timeout,
+      seekTimeout,
       'Normal seek took too long',
     );
 
-    const anySignal = CAF.signalRace([
-      cancelSignal,
-      timeoutToken.signal,
-    ]);
+    const timeoutSignal = timeoutToken.signal;
+    const anySignal = CAF.signalRace([cancelSignal, timeoutSignal]);
 
     const main = CAF(function* main(signal) {
       yield waitForMediaElementEvent({ signal, type: 'seeked' });
@@ -644,18 +737,69 @@ export default {
       const seekedPromise = main(anySignal);
       setCurrentTimeMs(seekToMs);
       const settleTimeout = rootGetters.GET_CONFIG.slplayer_seek_settle_timeout ?? 500;
-      const settleTolerance = rootGetters.GET_CONFIG.slplayer_seek_settle_tolerance ?? 250;
-      await Promise.race([
-        seekedPromise,
-        CAF.delay(anySignal, settleTimeout).then(() => {
-          if (Math.abs(getCurrentTimeMs() - seekToMs) <= settleTolerance) {
-            return undefined;
-          }
-          return seekedPromise;
-        }),
-      ]);
+      const settledWithoutEvent = CAF(function* waitForSettledPosition(signal) {
+        while (true) {
+          yield CAF.delay(signal, settleTimeout);
+          ensureCurrent();
+          if (!getMediaElement()?.seeking && landed(seekToMs, startedAt)) return;
+        }
+      });
+      let timedOut = false;
+      try {
+        await Promise.race([seekedPromise, settledWithoutEvent(anySignal)]);
+      } catch (error) {
+        ensureCurrent();
+        if (!timeoutSignal.aborted) throw error;
+        timedOut = true;
+      }
+      ensureCurrent();
+      timeoutToken.abort();
+      if (timedOut || !landed(seekToMs, startedAt)) {
+        dispatch('REPORT_PLAYBACK_DIAGNOSTIC', {
+          event: 'seek-landing-missed',
+          details: { targetTimeMs: seekToMs, actualTimeMs: getCurrentTimeMs(), elapsedMs: Date.now() - startedAt },
+        });
+        // One fresh Plex session per source. Repeated bad landings must not
+        // create a seek/reload storm; an explicit source change allows another try.
+        if (seekRebaseRevision === revision) {
+          blockCorrection();
+          return;
+        }
+        const offset = seekToMs + (paused ? 0 : (Date.now() - startedAt) * rate);
+        commit('SET_OFFSET_MS', offset);
+        const rebaseStartedAt = Date.now();
+        const recovery = new AbortController();
+        const cancelRecovery = () => recovery.abort();
+        cancelSignal?.addEventListener('abort', cancelRecovery, { once: true });
+        let recoveryTimedOut = false;
+        const deadline = setTimeout(() => {
+          recoveryTimedOut = true;
+          recovery.abort();
+        }, seekTimeout);
+        const rebase = dispatch('CHANGE_PLAYER_SRC', {
+          signal: recovery.signal, restorePaused: paused, ensureOwner,
+        });
+        revision = sourceRevision;
+        seekRebaseRevision = revision;
+        try {
+          if (cancelSignal?.aborted) recovery.abort();
+          await abortable(rebase, recovery.signal);
+          ensureCurrent();
+          if (!landed(offset, rebaseStartedAt)) blockCorrection();
+        } catch (error) {
+          ensureCurrent();
+          if (error?.name === 'AbortError' && !recoveryTimedOut) throw error;
+          blockCorrection();
+        } finally {
+          // Clear the deadline without aborting successful background subtitles.
+          clearTimeout(deadline);
+          cancelSignal?.removeEventListener('abort', cancelRecovery);
+        }
+      }
     } finally {
       timeoutToken.abort();
+      if (revision === sourceRevision && operation === automaticSeekRevision
+        && userRevision === getUserSeekRevision()) commit('SET_SYNC_SEEK_TARGET', null);
     }
   },
 
@@ -677,22 +821,36 @@ export default {
     return dispatch('NORMAL_SEEK', { cancelSignal, seekToMs });
   },
 
-  START_PERIODIC_PLEX_TIMELINE_UPDATE: async ({ commit, dispatch, rootGetters }) => {
+  START_PERIODIC_PLEX_TIMELINE_UPDATE: async ({
+    getters, commit, dispatch, rootGetters,
+  }) => {
+    getters.GET_PLEX_TIMELINE_UPDATER_CANCEL_TOKEN?.abort();
     // eslint-disable-next-line new-cap
     const cancelToken = new CAF.cancelToken();
-
     commit('SET_PLEX_TIMELINE_UPDATER_CANCEL_TOKEN', cancelToken);
+
+    const updateTimeline = (signal) => {
+      if (pendingPlexTimelineUpdate) return;
+      pendingPlexTimelineUpdate = Promise.resolve().then(() => {
+        throwIfAborted(signal);
+        return dispatch('SEND_PLEX_TIMELINE_UPDATE', { signal });
+      }).catch((error) => {
+        if (!signal.aborted) console.error(error);
+      }).finally(() => { pendingPlexTimelineUpdate = null; });
+    };
 
     const main = CAF(function* plexTimelineUpdater(signal) {
       while (true) {
         yield CAF.delay(signal, rootGetters.GET_CONFIG.slplayer_plex_timeline_update_interval);
-
+        if (signal.aborted) return;
+        // Plex availability must not suppress health reports on the independent room socket.
         try {
-          yield dispatch('SEND_PLEX_TIMELINE_UPDATE', { signal });
           yield dispatch('REPORT_PLAYBACK_DIAGNOSTIC', { event: 'playback-health' });
         } catch (e) {
           console.error(e);
         }
+        if (signal.aborted) return;
+        updateTimeline(signal);
       }
     });
 
@@ -721,7 +879,7 @@ export default {
   },
 
   LOAD_PLAYER_SRC: async ({ getters, commit, dispatch }, {
-    signal, ensureCurrent = () => {}, restorePaused,
+    signal, ensureCurrent = () => {}, restorePaused, onLoadStart = () => {},
   } = {}) => {
     const url = getters.GET_SRC_URL;
     const offset = getters.GET_OFFSET_MS;
@@ -732,6 +890,7 @@ export default {
     console.debug('LOAD_PLAYER_SRC: loading');
     const mediaElement = getMediaElement();
     if (mediaElement) mediaElement.autoplay = restorePaused !== true;
+    onLoadStart();
     await unload();
     throwIfAborted(signal);
     ensureCurrent();
@@ -755,45 +914,79 @@ export default {
     ensureCurrent();
   },
 
-  NAVIGATE_AND_INITIALIZE_PLAYER: ({ getters, commit }) => {
-    if (getters.GET_PLAYER_INITIALIZED_DEFERRED_PROMISE) {
-      return getters.GET_PLAYER_INITIALIZED_DEFERRED_PROMISE.promise;
-    }
+  NAVIGATE_AND_INITIALIZE_PLAYER: ({ getters, commit, dispatch }, {
+    signal, isCurrent = () => true,
+  } = {}) => {
+    throwIfAborted(signal);
+    let deferred = getters.GET_PLAYER_INITIALIZED_DEFERRED_PROMISE;
+    if (deferred) deferred.removeAbortListener?.();
+    else deferred = markRaw({ ...Deferred() });
+    deferred.isCurrent = isCurrent;
+    // A replacement play request can reuse attachment, but only its owner may cancel it.
+    const cancel = () => {
+      if (getters.GET_PLAYER_INITIALIZED_DEFERRED_PROMISE === deferred && isCurrent()) {
+        dispatch('CANCEL_PLAYER_INITIALIZATION');
+      }
+    };
+    signal?.addEventListener('abort', cancel, { once: true });
+    deferred.removeAbortListener = () => signal?.removeEventListener('abort', cancel);
+    if (getters.GET_PLAYER_INITIALIZED_DEFERRED_PROMISE) return deferred.promise;
     console.debug('NAVIGATE_AND_INITIALIZE_PLAYER');
     // I don't really like this. I'd rather have the player be part of the main app rather than a
     // vue route
     // TODO: above
 
     // TODO: this is bad practice, so if you know a better way...
-    const deferred = Deferred();
-
     commit('SET_PLAYER_INITIALIZED_DEFERRED_PROMISE', deferred);
     commit('SET_NAVIGATE_TO_PLAYER', true, { root: true });
 
     return deferred.promise;
   },
 
+  CANCEL_PLAYER_INITIALIZATION: (context, { isCurrent } = {}) => {
+    const deferred = context.getters.GET_PLAYER_INITIALIZED_DEFERRED_PROMISE;
+    if (!deferred) return false;
+    if (isCurrent) deferred.isCurrent = isCurrent;
+    deferred.controller?.abort();
+    rejectPendingInitialization(context, new DOMException('Playback cancelled', 'AbortError'));
+    // Clearing a request must not turn cancelled media into a direct-route auto-load.
+    context.commit('plexclients/SET_ACTIVE_MEDIA_METADATA', null, { root: true });
+    context.commit('plexclients/SET_ACTIVE_SERVER_ID', null, { root: true });
+    context.commit('SET_SHOULD_PLAY_ON_LOAD', null);
+    context.commit('SET_PLAYER_STATE', 'stopped');
+    context.dispatch('synclounge/PUBLISH_CANCELLED_PLAYBACK', null, { root: true });
+    deferred.cleanupPromise = deferred.controller
+      ? context.dispatch('ROLLBACK_PLAYER_INITIALIZATION') : Promise.resolve();
+    // Request cancellation is immediate; the route serializes retries behind this cleanup.
+    return true;
+  },
+
   INIT_PLAYER_STATE: async ({
     getters, rootGetters, commit, dispatch,
-  }) => {
+  }, { signal } = {}) => {
     console.debug('INIT_PLAYER_STATE');
 
     // eslint-disable-next-line new-cap
     commit('SET_PLAYER_DESTROY_CANCEL_TOKEN', new CAF.cancelToken());
     try {
+      throwIfAborted(signal);
       await dispatch('REGISTER_PLAYER_EVENTS');
+      throwIfAborted(signal);
       await dispatch('START_UPDATE_PLAYER_CONTROLS_SHOWN_INTERVAL');
+      throwIfAborted(signal);
       setVolume(rootGetters['settings/GET_SLPLAYERVOLUME']);
 
       // PLAY_MEDIA owns source loading when navigation has a waiting caller.
       if (!getters.GET_PLAYER_INITIALIZED_DEFERRED_PROMISE
         && rootGetters['plexclients/GET_ACTIVE_MEDIA_METADATA']
         && rootGetters['plexclients/GET_ACTIVE_SERVER_ID']) {
-        await dispatch('CHANGE_PLAYER_SRC');
+        await dispatch('CHANGE_PLAYER_SRC', { signal });
+        throwIfAborted(signal);
         const shouldPlayOnLoad = getters.GET_SHOULD_PLAY_ON_LOAD
           ?? (rootGetters['synclounge/GET_HOST_USER']?.state !== 'paused');
         if (shouldPlayOnLoad) {
           await dispatch('PRESS_PLAY');
+          throwIfAborted(signal);
         }
         commit('SET_SHOULD_PLAY_ON_LOAD', null);
 
@@ -802,30 +995,30 @@ export default {
       }
 
       if (getters.GET_PLAYER_INITIALIZED_DEFERRED_PROMISE) {
+        getters.GET_PLAYER_INITIALIZED_DEFERRED_PROMISE.removeAbortListener?.();
         getters.GET_PLAYER_INITIALIZED_DEFERRED_PROMISE.resolve();
         commit('SET_PLAYER_INITIALIZED_DEFERRED_PROMISE', null);
       }
 
       commit('SET_IS_PLAYER_INITIALIZED', true);
     } catch (e) {
-      console.error('INIT_PLAYER_STATE: failed during initialization:', e);
-      dispatch('synclounge/DISPLAY_NOTIFICATION', {
-        text: 'Failed to load media. If you have another tab playing, please close it and try again.',
-        color: 'error',
-      }, { root: true });
-      await dispatch('ROLLBACK_PLAYER_INITIALIZATION');
-      if (getters.GET_PLAYER_INITIALIZED_DEFERRED_PROMISE) {
-        getters.GET_PLAYER_INITIALIZED_DEFERRED_PROMISE.reject(e);
-        commit('SET_PLAYER_INITIALIZED_DEFERRED_PROMISE', null);
-      }
+      // Route teardown owns cancellation cleanup; an old continuation must not clear a new attempt.
+      if (!signal?.aborted) await dispatch('FAIL_PLAYER_INITIALIZATION', e);
       throw e;
     }
+  },
+
+  FAIL_PLAYER_INITIALIZATION: async (context, error) => {
+    rejectPendingInitialization(context, error);
+    await context.dispatch('ROLLBACK_PLAYER_INITIALIZATION');
   },
 
   ROLLBACK_PLAYER_INITIALIZATION: async ({ getters, commit, dispatch }) => {
     getters.GET_PLAYER_DESTROY_CANCEL_TOKEN?.abort();
     commit('SET_PLAYER_DESTROY_CANCEL_TOKEN', null);
     commit('STOP_UPDATE_PLAYER_CONTROLS_SHOWN_INTERVAL');
+    commit('SET_IS_PLAYER_INITIALIZED', false);
+    commit('SET_AUTOPLAY_BLOCKED', false);
 
     await Promise.allSettled([
       Promise.resolve().then(() => dispatch('UNREGISTER_PLAYER_EVENTS')),
@@ -833,9 +1026,6 @@ export default {
       Promise.resolve().then(() => dispatch('DESTROY_SUBTITLES')),
       Promise.resolve().then(() => destroy()),
     ]);
-
-    commit('SET_IS_PLAYER_INITIALIZED', false);
-    commit('SET_AUTOPLAY_BLOCKED', false);
   },
 
   CANCEL_PERIODIC_PLEX_TIMELINE_UPDATE: ({ getters, commit }) => {
@@ -850,6 +1040,22 @@ export default {
     streamRecovery.cancel();
     sourceRevision += 1;
     console.debug('DESTROY_PLAYER_STATE');
+    rejectPendingInitialization({ getters, commit }, new DOMException('Player closed', 'AbortError'));
+    if (getters.IS_PLAYER_INITIALIZED === false) {
+      // No usable player exists to publish a timeline, but leaving still clears media state.
+      commit('CLEAR_CAST_SYNC_INTERVAL');
+      commit('SET_FORCE_TRANSCODE_RETRY', false);
+      commit('UPDATE_PLAYER_CONTROLS_SHOWN', false);
+      commit('plexclients/SET_ACTIVE_MEDIA_METADATA', null, { root: true });
+      commit('plexclients/SET_ACTIVE_SERVER_ID', null, { root: true });
+      commit('SET_IS_IN_PICTURE_IN_PICTURE', false);
+      commit('SET_IS_CASTING', false);
+      commit('SET_SUBTITLE_OFFSET', 0);
+      commit('SET_OFFSET_MS', 0);
+      commit('SET_SYNC_SEEK_TARGET', null);
+      await dispatch('ROLLBACK_PLAYER_INITIALIZATION');
+      return;
+    }
     recordSeekIntent();
     bufferingStartedAt = null;
     bufferingEpisode = 0;

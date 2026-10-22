@@ -9,54 +9,22 @@
     @update:model-value="SET_RIGHT_SIDEBAR_OPEN"
   >
     <template #prepend>
-      <v-list-item
-        class="px-2 py-1"
-        density="compact"
-      >
-        <template #prepend>
-          <v-btn
-            icon
-            size="default"
-            aria-label="Close watch party"
-            variant="text"
-            @click="SET_RIGHT_SIDEBAR_OPEN(false)"
-          >
-            <v-icon size="small">
-              close
-            </v-icon>
-          </v-btn>
-        </template>
-
-        <v-list-item-title class="font-weight-bold mb-1">
-          Watch party
-        </v-list-item-title>
-
-        <v-list-item-subtitle
-          v-if="Object.keys(GET_USERS).length != 1"
-          class="participant-count"
-        >
-          {{ Object.keys(GET_USERS).length }} people
-        </v-list-item-subtitle>
-
-        <v-list-item-subtitle
-          v-else
-          class="participant-count"
-        >
-          It's just you, invite some friends
-        </v-list-item-subtitle>
-
-        <template #append>
-          <v-btn
-            icon
-            size="default"
-            variant="text"
-            aria-label="Leave watch party"
-            @click="DISCONNECT_AND_NAVIGATE_HOME"
-          >
-            <v-icon>exit_to_app</v-icon>
-          </v-btn>
-        </template>
-      </v-list-item>
+      <div class="party-header">
+        <div class="party-heading">
+          <h2 class="text-subtitle-1 font-weight-bold">
+            Watch party
+          </h2>
+          <p class="participant-count">
+            {{ Object.keys(GET_USERS).length === 1
+              ? "It's just you, invite some friends"
+              : `${Object.keys(GET_USERS).length} people` }}
+          </p>
+        </div>
+        <SidebarCloseButton
+          label="Close watch party sidebar"
+          @click="SET_RIGHT_SIDEBAR_OPEN(false)"
+        />
+      </div>
     </template>
 
     <div class="party-body">
@@ -64,17 +32,10 @@
         class="party-controls"
         aria-label="Watch party controls"
       >
-        <v-switch
-          class="px-3"
-          label="Advanced controls"
-          hide-details
-          density="compact"
-          :model-value="GET_ADVANCED_PARTY_MODE"
-          @update:model-value="SET_ADVANCED_PARTY_MODE"
-        />
         <v-list-item
+          v-if="AM_I_HOST || (GET_HOST_USER && GET_HOST_USER.state === 'stopped')"
           density="compact"
-          class="px-3 py-0 switch-item"
+          class="pa-0 switch-item"
         >
           <v-switch
             v-if="AM_I_HOST"
@@ -82,7 +43,7 @@
             density="compact"
             class="pa-0 ma-0 sidebar-switch"
             color="primary"
-            label="Party Pausing"
+            label="Let anyone pause the party"
             :model-value="IS_PARTY_PAUSING_ENABLED"
             @update:model-value="SEND_SET_PARTY_PAUSING_ENABLED"
           />
@@ -94,37 +55,11 @@
           </v-list-item-subtitle>
         </v-list-item>
 
-        <v-tooltip
-          v-if="AM_I_HOST && GET_ADVANCED_PARTY_MODE"
-          location="bottom"
-          content-class="thumbnail-tooltip"
-        >
-          <template #activator="{ props }">
-            <v-list-item
-              density="compact"
-              class="px-3 py-0 switch-item"
-              v-bind="props"
-            >
-              <v-switch
-                class="pa-0 ma-0 sidebar-switch"
-                hide-details
-                density="compact"
-                color="primary"
-                label="Auto Host"
-                :model-value="IS_AUTO_HOST_ENABLED"
-                @update:model-value="SEND_SET_AUTO_HOST_ENABLED"
-              />
-            </v-list-item>
-          </template>
-
-          <span>Automatically transfers host to other users when they play something new</span>
-        </v-tooltip>
-
         <v-list-item
           v-if="!AM_I_HOST
             && GET_HOST_USER && GET_HOST_USER.state !== 'stopped'"
           density="compact"
-          class="px-3 py-0"
+          class="pa-0"
         >
           <div class="d-flex ga-2">
             <v-tooltip
@@ -156,25 +91,6 @@
             </v-tooltip>
           </div>
         </v-list-item>
-
-        <div
-          v-if="syncPreset && GET_ADVANCED_PARTY_MODE"
-          class="px-3 py-2"
-        >
-          <v-select
-            :model-value="syncPreset"
-            :items="syncPresets"
-            label="Room synchronization"
-            density="compact"
-            :disabled="!AM_I_HOST"
-            hide-details
-            @update:model-value="SEND_SYNC_PRESET"
-          />
-          <p class="text-caption mt-2">
-            Relaxed allows up to 7 seconds of drift to reduce corrective seeks.
-            It cannot fix a slow stream.
-          </p>
-        </div>
       </section>
       <v-divider />
       <UserList class="party-users" />
@@ -191,6 +107,7 @@
 
 <script>
 import { defineAsyncComponent } from 'vue';
+import SidebarCloseButton from '@/components/SidebarCloseButton.vue';
 import {
   mapActions, mapGetters, mapMutations, mapState,
 } from 'vuex';
@@ -199,28 +116,17 @@ export default {
   name: 'TheSidebarRight',
 
   components: {
+    SidebarCloseButton,
     MessageList: defineAsyncComponent(() => import('@/components/MessageList.vue')),
     MessageInput: defineAsyncComponent(() => import('@/components/MessageInput.vue')),
     UserList: defineAsyncComponent(() => import('@/components/UserList.vue')),
   },
 
-  data: () => ({
-    syncPresets: [
-      { title: 'Strict · 0.5 seconds', value: 'strict' },
-      { title: 'Balanced · 3 seconds', value: 'balanced' },
-      { title: 'Relaxed · 7 seconds', value: 'relaxed' },
-      { title: 'Use each viewer’s setting', value: 'personal' },
-    ],
-  }),
-
   computed: {
-    ...mapGetters('settings', ['GET_ADVANCED_PARTY_MODE']),
-    ...mapState('synclounge', ['syncPreset']),
     ...mapState(['isRightSidebarOpen']),
 
     ...mapGetters('synclounge', [
       'IS_PARTY_PAUSING_ENABLED',
-      'IS_AUTO_HOST_ENABLED',
       'GET_USERS',
       'GET_HOST_USER',
       'AM_I_HOST',
@@ -229,13 +135,9 @@ export default {
   },
 
   methods: {
-    ...mapMutations('settings', ['SET_ADVANCED_PARTY_MODE']),
     ...mapActions('synclounge', [
-      'SEND_SYNC_PRESET',
       'SEND_SET_PARTY_PAUSING_ENABLED',
-      'SEND_SET_AUTO_HOST_ENABLED',
       'sendPartyPause',
-      'DISCONNECT_AND_NAVIGATE_HOME',
     ]),
 
     ...mapMutations([
@@ -247,22 +149,34 @@ export default {
 </script>
 
 <style scoped>
+.party-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 72px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--sl-border);
+}
+
+.party-heading {
+  flex: 1;
+  min-width: 0;
+}
+
 .party-body {
   display: flex;
   flex-direction: column;
-  min-height: 100%;
+  height: 100%;
+  min-height: 0;
 }
 
-.party-controls,
-.party-users {
-  flex: 0 0 auto;
-}
+.party-controls { flex: 0 0 auto; padding: 4px 16px 8px; }
+.party-users { flex: 0 1 auto; min-height: 0; }
 
 .messages {
   overflow-y: auto;
-  flex: 1 0 180px;
-  max-height: 60dvh;
-  min-height: 180px;
+  flex: 1 1 96px;
+  min-height: 96px;
 }
 
 .participant-count {
@@ -270,13 +184,20 @@ export default {
   color: rgb(255 255 255 / 70%);
 }
 
+.party-controls :deep(.v-selection-control) { min-height: 36px; }
+.party-controls :deep(.v-input) { flex: 0 0 auto; }
+
+.party-controls :deep(.v-label) { white-space: normal; }
+
 .switch-item :deep(.v-list-item__content) {
   overflow: visible;
 }
 
 .sidebar-switch :deep(.v-selection-control) {
-  min-height: 44px;
+  min-height: 36px;
 }
+
+.sidebar-switch :deep(.v-selection-control__wrapper) { width: 40px; }
 
 .sidebar-switch :deep(.v-switch__track) {
   width: 30px;

@@ -55,13 +55,17 @@ SyncLounge keeps multiple viewing sessions in sync using a WebSocket server as a
 
 ## Watch-party controls and troubleshooting
 
-New rooms open on library browsing. On phones, library navigation shows a back action and the current location. Media rows support touch scrolling; desktop users can also use the arrows. Invite copies the room link. Settings → Advanced contains the optional watch-party service selector, separate from Plex library selection.
+New rooms open on library browsing. On phones, library navigation shows a back action and the current location. Media rows support touch scrolling; desktop users can also use the arrows. Invite copies the room link; the browser address also preserves the room and current page for sharing. Settings → Advanced contains the optional watch-party service selector, separate from Plex library selection.
 
-The watch-party drawer starts in Basic mode. Advanced controls reveal synchronization settings and participant diagnostics; the message composer stays available in landscape and while typing.
+The watch-party drawer keeps viewers, chat, and party pausing visible. Settings → Advanced contains Show party diagnostics, automatic host transfer, and the room synchronization preset; the message composer stays available in landscape and while typing.
 
 The host can choose Strict (0.5 seconds), Balanced (3 seconds), or Relaxed (7 seconds) room synchronization, or use each viewer’s personal tolerance. Relaxed synchronization reduces corrective seeks; it cannot repair a slow stream. Participant details show playback state, drift, and recent buffer/quality measurements. After repeated substantial buffering, Settings can offer a lower-quality option for that viewer; applying it may require Plex transcoding.
 
 Settings → Notifications can hide buffering popups without disabling playback diagnostics. Menu → Report a problem copies a bounded report for sharing with the host, without requiring GitHub. Include what happened and the report’s timestamp; Plex/transcode session identifiers connect it to server logs. Raw error messages, credentials, and chat are excluded. GitHub issue creation is optional and requires pasting the report into the issue.
+
+If the player cannot start, use **Retry playback** to start a fresh attempt. Leaving the player cancels pending startup. **Manual sync** reports success only after synchronization and a state refresh complete; if the room is disconnected or the host has no usable playback, reconnect or wait for the host before retrying. A superseded sync stays quiet.
+
+Player shortcuts leave focused controls, text fields, and dialogs to their own keyboard handling. Space on the seek bar still sends the party play/pause command. Custom playback buttons include descriptive accessible names and tooltips. Playback health reporting continues when Plex timeline reporting is unavailable, provided the room socket remains connected.
 
 Picture-in-picture remains available when the browser supports it. Installed iOS web apps may have platform limitations; SyncLounge does not force picture-in-picture when leaving the app.
 
@@ -104,8 +108,9 @@ option. Installation uses the root of the hostname, matching the supported deplo
 
 Watching and chatting require a connection. The offline screen caches only public assets;
 room pages, credentials, posters, and video are never cached by the service worker.
-When an update is ready, choose **Update available → Reload now** between viewing sessions.
-Updates do not automatically reload an active player.
+Updates apply automatically when opening or returning to an idle sign-in or room-creation screen.
+Room entry and active rooms defer automatic reloads. During a viewing session,
+**Update available → Reload now** remains an explicit action for when you are ready.
 
 ## Configuration
 
@@ -137,9 +142,11 @@ able to create or own that private directory; it must not be group- or world-wri
 as static content or share it between concurrently running servers. Without this option,
 restarting the server resets reconnect identities and room ownership.
 
-After a restart, a remembered host has 60 seconds to rejoin with its existing tab proof;
-a host that was playing must restore media before reclaiming control. Explicit host
-transfers override recovery. Inactive ownership records expire after 24 hours. Enabling
+After a restart or a transient connection loss, a remembered host has 60 seconds to
+rejoin with its existing tab proof; a host that was playing must restore media before
+reclaiming control. With persistence enabled, the room's settings survive even when
+all participants briefly disconnect. Intentional final departures remove the saved
+ownership, and explicit host transfers override recovery. Inactive ownership records expire after 24 hours. Enabling
 persistence for the first time cannot recover proofs from an earlier server instance.
 
 Only documented browser configuration is returned from `/config.json`; arbitrary keys in a
@@ -201,7 +208,10 @@ SKIP_BUILD=true npm ci
 npm run serve   # Vite dev server with HMR
 npm run build   # Production build to dist/
 npm test        # Run tests
+npm run test:sync-fuzz # Replay sync regressions and seeded decoder faults
 ```
+
+See [the sync harness](docs/sync-harness.md) for fault scenarios and seed replay.
 
 Pull requests target `dev`; `main` is reserved for stable release promotions. See [CONTRIBUTING.md](CONTRIBUTING.md) for the complete verification and review contract.
 

@@ -88,6 +88,9 @@ export default {
   align-self: flex-start !important;
 }
 .message-heading {
+  min-height: 20px;
+  line-height: 20px;
+  font-size: 14px;
   display: flex;
   flex-wrap: wrap;
   align-items: baseline;
@@ -104,6 +107,7 @@ export default {
   color: rgb(255 255 255 / 40%);
   font-weight: 400;
   font-size: 11px;
+  font-variant-numeric: tabular-nums;
   flex-shrink: 0;
   white-space: nowrap;
 }

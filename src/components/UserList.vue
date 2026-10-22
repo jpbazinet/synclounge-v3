@@ -6,7 +6,7 @@
     <v-list-item
       v-for="(user, id) in GET_USERS"
       :key="id"
-      class="user-row px-3 py-1"
+      class="user-row"
     >
       <div class="user-heading">
         <v-avatar
@@ -45,9 +45,9 @@
                   class="text-medium-emphasis"
                 >(you)</span>
               </div>
-              <div class="user-meta text-caption text-medium-emphasis">
-                <span class="user-state">{{ user.state || 'Connecting' }}</span>
+              <div class="user-meta">
                 <span class="user-time">{{ getTimeFromMs(getAdjustedTime(user)) }}</span>
+                <span class="user-readiness">{{ readinessLabel(user, id) }}</span>
               </div>
             </div>
           </template>
@@ -60,58 +60,46 @@
           </span>
         </v-tooltip>
         <div class="user-actions">
-          <v-tooltip
-            v-if="id === GET_HOST_ID || AM_I_HOST"
-            location="bottom"
-            content-class="thumbnail-tooltip"
+          <v-chip
+            v-if="id === GET_HOST_ID"
+            size="x-small"
+            color="primary"
+            variant="tonal"
           >
-            <template #activator="{ props }">
-              <v-btn
-                v-if="AM_I_HOST && id !== GET_HOST_ID"
-                v-bind="props"
-                icon="star_outline"
-                size="small"
-                color="primary"
-                variant="text"
-                :aria-label="`Make ${user.username} the host`"
-                @click="TRANSFER_HOST(id)"
-              />
-              <v-icon
-                v-else
-                v-bind="props"
-                color="primary"
-                role="img"
-                :aria-label="`${user.username} is the host`"
-              >
-                star
-              </v-icon>
-            </template>
-            <span>{{ getHostActionText(id === GET_HOST_ID) }}</span>
-          </v-tooltip>
-          <v-tooltip
-            v-if="id !== GET_HOST_ID && AM_I_HOST"
-            location="bottom"
-            content-class="thumbnail-tooltip"
-          >
+            Host
+          </v-chip>
+          <v-menu v-if="AM_I_HOST && id !== GET_HOST_ID">
             <template #activator="{ props }">
               <v-btn
                 v-bind="props"
-                icon="clear"
+                icon="more_vert"
                 size="small"
+                class="participant-action"
                 variant="text"
-                :aria-label="`Remove ${user.username} from the room`"
-                @click="KICK_USER(id)"
+                :aria-label="`Actions for ${user.username}`"
+                :title="`Actions for ${user.username}`"
               />
             </template>
-            <span>Remove from room</span>
-          </v-tooltip>
+            <v-list density="compact">
+              <v-list-item
+                title="Make host"
+                prepend-icon="star_outline"
+                @click="requestModeration(id, 'transfer')"
+              />
+              <v-list-item
+                title="Remove from room"
+                prepend-icon="person_remove"
+                @click="requestModeration(id, 'remove')"
+              />
+            </v-list>
+          </v-menu>
         </div>
       </div>
       <div
         v-if="GET_ADVANCED_PARTY_MODE"
         class="user-status text-caption text-medium-emphasis"
       >
-        <span>{{ driftLabel(user) }}</span>
+        {{ driftLabel(user) }}
       </div>
       <ul
         v-if="user.health && GET_ADVANCED_PARTY_MODE"
@@ -124,13 +112,66 @@
           {{ detail }}
         </li>
       </ul>
+      <v-progress-linear
+        v-if="GET_ADVANCED_PARTY_MODE"
+        class="pt-content-progress mt-1"
+        :height="2"
+        :model-value="percent(user)"
+      />
     </v-list-item>
+    <v-dialog
+      :model-value="!!moderationTarget && AM_I_HOST"
+      max-width="420"
+      :aria-label="moderationTitle"
+      :persistent="moderationPending"
+      @update:model-value="!$event && (moderation = null)"
+    >
+      <v-card v-if="moderationTarget">
+        <v-card-title class="moderation-title">
+          {{ moderationTitle }}
+        </v-card-title>
+        <v-card-text>
+          {{ moderation.action === 'remove'
+            ? 'This disconnects them from the watch party. They can rejoin with the room link.'
+            : 'They will control what the party watches and manage room settings.' }}
+          <v-alert
+            v-if="moderationError"
+            type="error"
+            class="mt-3"
+          >
+            {{ moderationError }}
+          </v-alert>
+        </v-card-text>
+        <v-card-actions class="moderation-actions">
+          <v-btn
+            :disabled="moderationPending"
+            @click="moderation = null"
+          >
+            Cancel
+          </v-btn>
+          <v-btn
+            :loading="moderationPending"
+            color="primary"
+            variant="flat"
+            @click="confirmModeration"
+          >
+            {{ moderation.action === 'remove' ? 'Remove from room' : 'Make host' }}
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
   </v-list>
 </template>
 
 <script>
 import { mapActions, mapGetters } from 'vuex';
 import contentTitle from '@/mixins/contentTitle';
+
+const participantTiming = (context, user) => ({
+  difference: context.GET_HOST_USER
+    ? context.getAdjustedTime(user) - context.getAdjustedTime(context.GET_HOST_USER) : NaN,
+  tolerance: Number.isFinite(user.syncFlexibility) && user.syncFlexibility >= 0 ? user.syncFlexibility : 500,
+});
 
 export default {
   name: 'UserList',
@@ -140,6 +181,9 @@ export default {
   ],
 
   data: () => ({
+    moderation: null,
+    moderationPending: false,
+    moderationError: null,
     stateIcons: {
       stopped: 'stop',
       paused: 'pause',
@@ -153,6 +197,16 @@ export default {
   }),
 
   computed: {
+    moderationTitle() {
+      if (!this.moderationTarget) return '';
+      return this.moderation.action === 'remove'
+        ? `Remove ${this.moderationTarget.username}?`
+        : `Make ${this.moderationTarget.username} the host?`;
+    },
+    moderationTarget() {
+      if (!this.moderation || this.moderation.id === this.GET_HOST_ID) return null;
+      return this.GET_USERS[this.moderation.id];
+    },
     ...mapGetters('settings', ['GET_ADVANCED_PARTY_MODE']),
     ...mapGetters([
       'GET_CONFIG',
@@ -160,7 +214,6 @@ export default {
 
     ...mapGetters('synclounge', [
       'GET_USERS',
-      'GET_ADJUSTED_HOST_TIME',
       'GET_HOST_USER',
       'GET_SOCKET_ID',
       'GET_HOST_ID',
@@ -189,6 +242,42 @@ export default {
       'KICK_USER',
     ]),
 
+    requestModeration(id, action) {
+      if (!this.AM_I_HOST || id === this.GET_HOST_ID || !this.GET_USERS[id]) return;
+      this.moderationError = null;
+      this.moderation = { id, action };
+    },
+
+    async confirmModeration() {
+      if (!this.AM_I_HOST || !this.moderationTarget || this.moderationPending) return;
+      this.moderationPending = true;
+      try {
+        const { id, action } = this.moderation;
+        await (action === 'remove' ? this.KICK_USER(id) : this.TRANSFER_HOST(id));
+        this.moderation = null;
+      } catch {
+        this.moderationError = 'Couldn’t update this participant. Try again.';
+      } finally {
+        this.moderationPending = false;
+      }
+    },
+
+    readinessLabel(user, id) {
+      if (!user.state) return 'Connecting';
+      if (user.state === 'buffering') return 'Buffering';
+      if (!user.media || user.state === 'stopped') return 'Not watching';
+      if (id === this.GET_HOST_ID) return user.state === 'paused' ? 'Paused' : 'Playing';
+      const timing = this.driftLabel(user);
+      if (timing === 'Different media') return 'Different movie or episode';
+      if (timing === 'Timing unavailable') return 'Sync status unavailable';
+      const { difference, tolerance } = participantTiming(this, user);
+      if (!Number.isFinite(difference)) return 'Sync status unavailable';
+      if (Math.abs(difference) <= tolerance) return user.state === 'paused' ? 'Paused · In sync' : 'In sync';
+      const direction = difference > 0 ? 'ahead' : 'behind';
+      const label = `${(Math.abs(difference) / 1000).toFixed(1)}s ${direction}`;
+      return user.state === 'paused' ? `Paused · ${label}` : label;
+    },
+
     driftLabel(user) {
       const hostMedia = this.GET_HOST_USER?.media;
       if (!hostMedia || !user.media) return 'Timing unavailable';
@@ -201,9 +290,10 @@ export default {
         && (hostMedia.type !== 'episode' || (user.media.grandparentTitle === hostMedia.grandparentTitle
           && user.media.parentIndex === hostMedia.parentIndex && user.media.index === hostMedia.index));
       if (!sameSource && !matchingTitle) return 'Different media';
-      const drift = (this.getAdjustedTime(user) - this.GET_ADJUSTED_HOST_TIME()) / 1000;
+      const { difference, tolerance } = participantTiming(this, user);
+      const drift = difference / 1000;
       if (!Number.isFinite(drift)) return 'Timing unavailable';
-      const timing = Math.abs(drift) < 0.5 ? 'In sync'
+      const timing = Math.abs(difference) <= tolerance ? 'In sync'
         : `${Math.abs(drift).toFixed(1)}s ${drift < 0 ? 'behind' : 'ahead'}`;
       return sameSource ? timing : `${timing} (estimated)`;
     },
@@ -222,20 +312,14 @@ export default {
       updatedAt, state, time, playbackRate,
     }) {
       return state === 'playing'
-        ? time + (this.nowTimestamp - updatedAt) * playbackRate
+        ? time + (this.nowTimestamp - updatedAt) * (playbackRate || 1)
         : time;
     },
 
-    getSyncBorderClass({ syncFlexibility, ...rest }) {
-      if (!this.GET_HOST_USER) {
-        return 'border-error';
-      }
-
-      const difference = Math.abs(this.getAdjustedTime(rest) - this.GET_ADJUSTED_HOST_TIME());
-
-      return difference > syncFlexibility
-        ? 'border-desync'
-        : 'border-sync';
+    getSyncBorderClass(user) {
+      const { difference, tolerance } = participantTiming(this, user);
+      if (!Number.isFinite(difference)) return 'border-error';
+      return Math.abs(difference) > tolerance ? 'border-desync' : 'border-sync';
     },
 
     getTitle(media) {
@@ -289,8 +373,12 @@ export default {
 </script>
 
 <style scoped>
+.moderation-title { white-space: normal; overflow-wrap: anywhere; }
+.moderation-actions { flex-wrap: wrap; }
+
 .user-list {
-  max-height: calc(50vh - 100px);
+  padding-block: 0;
+  min-height: 0;
 }
 
 .avatar-img {
@@ -326,7 +414,12 @@ export default {
   border-color: #0de47499;
 }
 
-.user-heading { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.user-list .user-row { padding: 4px 12px; }
+.user-meta { display: flex; align-items: baseline; gap: 8px; line-height: 18px; color: rgb(255 255 255 / 65%); }
+.user-readiness { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.participant-action { width: 32px; height: 32px; }
+@media (pointer: coarse) { .participant-action { width: 40px; height: 40px; } }
+.user-heading { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .user-avatar, .user-actions { flex-shrink: 0; }
 .user-identity { flex: 1 1 auto; min-width: 0; }
 .user-actions { display: flex; align-items: center; gap: 2px; }
@@ -337,6 +430,8 @@ export default {
 .user-row + .user-row { border-top: 1px solid rgba(255, 255, 255, 0.06); }
 
 .user-name {
+  font-size: 14px;
+  line-height: 20px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -350,6 +445,9 @@ export default {
 .user-time {
   font-size: 75%;
   opacity: 0.55;
+  font-variant-numeric: tabular-nums;
+  min-width: 5ch;
+  font-size: 12px;
   flex-shrink: 0;
 }
 </style>

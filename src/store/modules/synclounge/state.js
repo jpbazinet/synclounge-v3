@@ -1,4 +1,5 @@
 const state = () => ({
+  roomFieldRevisions: {},
   syncPreset: null,
   syncPresetRevision: 0,
   socketId: null,
@@ -25,6 +26,7 @@ const state = () => ({
 
   // Join sync guard: prevents local sync dispatches during initial media load
   joinSyncInProgress: false,
+  roomJoinPending: false,
 
   // Host leave grace period: delays host transfer so original host can reconnect
   hostGracePreviousHostIdentity: null,

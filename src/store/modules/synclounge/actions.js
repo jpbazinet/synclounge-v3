@@ -21,6 +21,9 @@ const getSocketEventTimeout = (rootGetters) => {
     : DEFAULT_SOCKET_EVENT_TIMEOUT;
 };
 
+let manualSyncRevision = 0;
+let retriedGuestStartup = null;
+
 // Hold the requested party-pause state until the host confirms the matching command.
 let pendingPartyPause = null;
 let pendingPartyPauseFallbackTimeout = null;
@@ -71,6 +74,7 @@ const ensureRoomJoinCurrent = (revision) => {
 const invalidateRoomJoin = ({ commit }) => {
   const revision = beginRoomJoin();
   commit('SET_JOIN_SYNC_IN_PROGRESS', false);
+  commit('SET_ROOM_JOIN_PENDING', false);
   return revision;
 };
 
@@ -97,6 +101,7 @@ export default {
     { server, room, syncOnJoin = true },
   ) => {
     const revision = beginRoomJoin();
+    commit('SET_ROOM_JOIN_PENDING', true);
     try {
       await dispatch('DISCONNECT_IF_CONNECTED', { revision });
       ensureRoomJoinCurrent(revision);
@@ -115,6 +120,8 @@ export default {
     } catch (error) {
       ensureRoomJoinCurrent(revision);
       throw error;
+    } finally {
+      if (revision === roomJoinRevision) commit('SET_ROOM_JOIN_PENDING', false);
     }
   },
 
@@ -202,6 +209,9 @@ export default {
     // Note: this is also called on rejoining, so be careful not to register handlers twice
     // or duplicate tasks
     ensureRoomJoinCurrent(revision);
+    const roomFieldRevisions = { ...getters.GET_ROOM_FIELD_REVISIONS };
+    const hasNewRoomField = (field) => (getters.GET_ROOM_FIELD_REVISIONS?.[field] || 0)
+      !== (roomFieldRevisions[field] || 0);
     const joinStartRevision = getters.GET_USER_EVENT_REVISION || 0;
     const presetRevision = getters.GET_SYNC_PRESET_REVISION || 0;
     const {
@@ -209,9 +219,10 @@ export default {
     } = await dispatch('JOIN_ROOM', { revision });
     ensureRoomJoinCurrent(revision);
     clearPendingPartyPause();
-    await dispatch('CLEAR_HOST_GRACE_PERIOD');
+    // Preserve host transitions received while the join snapshot was pending.
+    if (!hasNewRoomField('host')) await dispatch('CLEAR_HOST_GRACE_PERIOD');
     ensureRoomJoinCurrent(revision);
-    await dispatch('CLEAR_HOST_RESTORE_PENDING');
+    if (!hasNewRoomField('host')) await dispatch('CLEAR_HOST_RESTORE_PENDING');
     ensureRoomJoinCurrent(revision);
     const timeline = await dispatch('plexclients/FETCH_TIMELINE_POLL_DATA_CACHE', null, { root: true });
     ensureRoomJoinCurrent(revision);
@@ -219,7 +230,7 @@ export default {
     const currentUsers = getters.GET_USERS;
     const eventRevisions = getters.GET_USER_EVENT_REVISIONS || {};
 
-    commit('SET_HOST_ID', hostId);
+    if (!hasNewRoomField('host')) commit('SET_HOST_ID', hostId);
 
     // Apply the snapshot without discarding socket events processed while JOIN_ROOM was pending.
     commit('SET_USERS', Object.fromEntries(
@@ -277,8 +288,10 @@ export default {
     if ((getters.GET_SYNC_PRESET_REVISION || 0) === presetRevision) {
       commit('SET_SYNC_PRESET', syncPreset ?? null);
     }
-    commit('SET_IS_PARTY_PAUSING_ENABLED', isPartyPausingEnabled);
-    commit('SET_IS_AUTO_HOST_ENABLED', isAutoHostEnabled);
+    if (!hasNewRoomField('partyPause')) {
+      commit('SET_IS_PARTY_PAUSING_ENABLED', isPartyPausingEnabled);
+    }
+    if (!hasNewRoomField('autoHost')) commit('SET_IS_AUTO_HOST_ENABLED', isAutoHostEnabled);
     commit('SET_IS_IN_ROOM', true);
     await dispatch('SEND_SYNC_FLEXIBILITY_UPDATE');
     ensureRoomJoinCurrent(revision);
@@ -363,6 +376,7 @@ export default {
     commit('SET_MESSAGES_USER_CACHE', {});
     commit('SET_IS_PARTY_PAUSING_ENABLED', null);
     commit('SET_IS_AUTO_HOST_ENABLED', null);
+    commit('SET_SYNC_PRESET', null);
   },
 
   SEND_MESSAGE: async ({ dispatch, getters }, msg) => {
@@ -634,6 +648,23 @@ export default {
     }
   },
 
+  PUBLISH_CANCELLED_PLAYBACK: ({ getters, commit }) => {
+    const id = getters.GET_SOCKET_ID;
+    if (!getters.IS_IN_ROOM || !isConnected() || !getters.GET_USER(id)) return;
+    const playerState = {
+      state: 'stopped', time: 0, duration: 0, playbackRate: 0,
+    };
+    commit('SET_USER_MEDIA', { id, media: null });
+    commit('SET_USER_PLAYER_STATE', { id, ...playerState });
+    // Synchronous publication cannot arrive after a newer local play request's update.
+    emit({
+      eventName: 'mediaUpdate',
+      data: {
+        media: null, roomPreview: null, ...playerState, userInitiated: false,
+      },
+    });
+  },
+
   PROCESS_MEDIA_UPDATE: async ({
     dispatch, getters, commit, rootGetters,
   }, userInitiated) => {
@@ -755,26 +786,60 @@ export default {
 
   MANUAL_SYNC: async ({
     getters, dispatch, commit,
-  }) => {
-    console.debug('MANUAL_SYNC');
+  }, { notify = false } = {}) => {
+    manualSyncRevision += 1;
+    const revision = manualSyncRevision;
+    let token;
+    const unavailableReason = () => {
+      if (!getters.IS_IN_ROOM || !isConnected()) {
+        return 'Reconnect to your room before syncing.';
+      }
+      const host = getters.GET_HOST_USER;
+      if (!host || !['playing', 'paused', 'buffering'].includes(host.state)
+        || !Number.isFinite(host.time) || host.time < 0
+        || (host.state === 'playing' && !Number.isFinite(host.updatedAt))) {
+        return 'Wait for the host to start playback, then try syncing again.';
+      }
+      return null;
+    };
+    const finish = async (status, text) => {
+      if (token && getters.GET_SYNC_CANCEL_TOKEN === token) commit('SET_SYNC_CANCEL_TOKEN', null);
+      if (revision !== manualSyncRevision) return { status: 'cancelled' };
+      if (notify && status !== 'cancelled') {
+        await dispatch('DISPLAY_NOTIFICATION', {
+          text: text || 'Synced', color: status === 'success' ? 'success' : 'error',
+        }, { root: true });
+      }
+      return { status };
+    };
+    const initialReason = unavailableReason();
+    if (initialReason) return finish('failure', initialReason);
     await dispatch('CANCEL_IN_PROGRESS_SYNC');
+    if (revision !== manualSyncRevision) return { status: 'cancelled' };
 
     // eslint-disable-next-line new-cap
-    const token = new CAF.cancelToken();
+    token = new CAF.cancelToken();
     commit('SET_SYNC_CANCEL_TOKEN', token);
+    const isCurrent = () => revision === manualSyncRevision
+      && !token.signal.aborted && getters.GET_SYNC_CANCEL_TOKEN === token;
     try {
+      const reasonBeforeSync = unavailableReason();
+      if (reasonBeforeSync) return finish('failure', reasonBeforeSync);
       await dispatch('plexclients/SYNC', token.signal, { root: true });
-    } catch (e) {
-      if (!token.signal.aborted) {
-        console.error('Error in manual sync:', e);
-      }
+      if (!isCurrent()) return finish('cancelled');
+      const reasonAfterSync = unavailableReason();
+      if (reasonAfterSync) return finish('failure', reasonAfterSync);
+      // Refresh stored time/updatedAt only after a completed sync.
+      await dispatch('PROCESS_PLAYER_STATE_UPDATE', true);
+    } catch (error) {
+      if (!isCurrent()) return finish('cancelled');
+      console.error('Error in manual sync:', error);
+      return finish('failure', 'Could not sync. Please try again.');
     }
 
-    if (getters.GET_SYNC_CANCEL_TOKEN === token) {
-      commit('SET_SYNC_CANCEL_TOKEN', null);
-      // Refresh stored time/updatedAt so sidebar displays the new position immediately
-      await dispatch('PROCESS_PLAYER_STATE_UPDATE', true);
-    }
+    if (!isCurrent()) return finish('cancelled');
+    const finalReason = unavailableReason();
+    return finish(finalReason ? 'failure' : 'success', finalReason);
   },
 
   FORCE_SYNC_ALL: async ({ dispatch }) => {
@@ -929,11 +994,30 @@ export default {
     await dispatch('_SYNC_PLAYER_STATE', cancelSignal);
   },
 
-  SYNC_PLAYER_STATE: async ({ dispatch, getters, commit }) => {
+  SYNC_PLAYER_STATE: async ({
+    dispatch, getters, commit, rootGetters,
+  }) => {
     if (getters.AM_I_HOST || getters.GET_SYNC_CANCEL_TOKEN || getters.IS_HOST_GRACE_PERIOD
       || getters.GET_HOST_RESTORE_PENDING_ID) {
       return;
     }
+
+    // A cancelled startup can leave selected metadata without a loaded stream.
+    // Retry media selection once, rather than polling/seeking an empty decoder forever.
+    if (rootGetters?.['slplayer/GET_MASK_PLAYER_STATE']) {
+      if (rootGetters['slplayer/IS_CHANGING_SOURCE']) return;
+      const media = getters.GET_HOST_USER?.media;
+      if (!media || !rootGetters['settings/GET_AUTOPLAY']) return;
+      const key = JSON.stringify([
+        getters.GET_ROOM, getters.GET_HOST_ID, media.machineIdentifier, media.ratingKey,
+      ]);
+      if (retriedGuestStartup === key) return;
+      retriedGuestStartup = key;
+      dispatch('slplayer/REPORT_PLAYBACK_DIAGNOSTIC', { event: 'guest-startup-retry' }, { root: true });
+      await dispatch('SYNC_MEDIA_AND_PLAYER_STATE');
+      return;
+    }
+    retriedGuestStartup = null;
 
     // eslint-disable-next-line new-cap
     const token = new CAF.cancelToken();

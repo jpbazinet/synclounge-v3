@@ -4,9 +4,16 @@
     density="compact"
     @scroll.passive="onScroll"
   >
-    <v-list-subheader class="md-4">
+    <v-list-subheader class="chat-section-title">
       Chat
     </v-list-subheader>
+
+    <p
+      v-if="!GET_MESSAGES.length"
+      class="chat-empty"
+    >
+      No messages yet. Say hello.
+    </p>
 
     <MessageItem
       v-for="msg in GET_MESSAGES"
@@ -74,3 +81,8 @@ export default {
   },
 };
 </script>
+
+<style scoped>
+.chat-section-title { min-height: 36px; padding-inline: 16px; font-size: 12px; font-weight: 600; }
+.chat-empty { margin: 0; padding: 4px 16px 12px; font-size: 13px; color: var(--sl-text-muted); }
+</style>

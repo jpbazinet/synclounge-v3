@@ -18,6 +18,9 @@ test('sanitizes structured playback diagnostics without accepting unrelated fiel
     browser: { name: 'firefox', os: 'Linux\nforged-log-line' },
     playback: {
       currentTime: 10,
+      reportedState: 'buffering',
+      sourceChanging: true,
+      stateMasked: false,
       isCasting: true,
       buffering: false,
       bufferAhead: Number.POSITIVE_INFINITY,
@@ -31,6 +34,9 @@ test('sanitizes structured playback diagnostics without accepting unrelated fiel
   assert.equal(diagnostic.browser.os, 'Linux forged-log-line');
   assert.deepEqual(diagnostic.details, { episode: 3, durationMs: 142, attempt: 2 });
   assert.equal(diagnostic.playback.currentTime, 10);
+  assert.equal(diagnostic.playback.reportedState, 'buffering');
+  assert.equal(diagnostic.playback.sourceChanging, true);
+  assert.equal(diagnostic.playback.stateMasked, false);
   assert.equal(diagnostic.playback.isCasting, true);
   assert.equal(diagnostic.playback.buffering, false);
   assert.equal(diagnostic.playback.bufferAhead, null);
@@ -107,5 +113,25 @@ test('bounds recovery attempts from untrusted diagnostic payloads', () => {
   for (const attempt of [-1, 4, '2', null, true, {}, [], Number.NaN, Number.POSITIVE_INFINITY]) {
     const result = sanitizePlaybackDiagnostic({ event: 'stream-recovery-start', details: { attempt } });
     assert.equal(result.details.attempt, null);
+  }
+});
+
+test('preserves bounded seek landing evidence without accepting arbitrary details', () => {
+  const diagnostic = sanitizePlaybackDiagnostic({
+    event: 'seek-landing-missed',
+    details: {
+      targetTimeMs: 2582387, actualTimeMs: 2600639, elapsedMs: 262, privateValue: 'not-allowed',
+    },
+  });
+  assert.deepEqual(diagnostic.details, { targetTimeMs: 2582387, actualTimeMs: 2600639, elapsedMs: 262 });
+});
+
+test('bounds every seek landing timing field for malformed and boundary values', () => {
+  for (const value of [-1, NaN, Infinity, 31536000001, '262', 31536000000]) {
+    const details = Object.fromEntries(['targetTimeMs', 'actualTimeMs', 'elapsedMs'].map((key) => [key, value]));
+    const sanitized = sanitizePlaybackDiagnostic({ event: 'seek-landing-missed', details }).details;
+    for (const field of Object.keys(details)) {
+      assert.equal(sanitized[field], value === 31536000000 ? value : null);
+    }
   }
 });

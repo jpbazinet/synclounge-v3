@@ -18,6 +18,7 @@ const loadToNumber = (load) => {
 const healthScore = (health) => health.latency + loadToNumber(health.load) * 10;
 
 export default {
+  GET_ROOM_FIELD_REVISIONS: (state) => state.roomFieldRevisions,
   GET_SYNC_PRESET_REVISION: (state) => state.syncPresetRevision,
   GET_MESSAGES_USER_CACHE_USER: (state) => (id) => state.messagesUserCache[id],
   GET_USER: (state, getters) => (id) => getters.GET_USERS[id],
@@ -87,6 +88,7 @@ export default {
     ?? rootGetters.GET_CONFIG?.default_are_sound_notification_enabled,
 
   IS_JOIN_SYNC_IN_PROGRESS: (state) => state.joinSyncInProgress,
+  IS_ROOM_JOIN_PENDING: (state) => state.roomJoinPending,
 
   GET_HOST_GRACE_TIMEOUT_ID: (state) => state.hostGraceTimeoutId,
   IS_HOST_GRACE_PERIOD: (state) => state.isHostGracePeriod,
